@@ -18,8 +18,8 @@ Added `-t / --threads` parameter for multiprocessing. All other parameters and o
 ## Usage
 
 ```bash
-# Parallel: auto-detect cores (default), or specify
-python3 vcf2phylip.py -i myfile.vcf -f          # uses all CPU cores
+# Auto-detect cores (default), or specify
+python3 vcf2phylip.py -i myfile.vcf -f          # uses available CPUs (respects SLURM/cgroup)
 python3 vcf2phylip.py -i myfile.vcf -f -t 4     # 4 processes
 python3 vcf2phylip.py -i myfile.vcf -f -t 1     # single-threaded (original behavior)
 ```
@@ -44,7 +44,7 @@ optional arguments:
   -b, --nexus-binary
   -r, --resolve-IUPAC
   -w, --write-used-sites
-  -t THREADS, --threads THREADS    Parallel processes (default=0, auto-detect CPU cores)
+  -t THREADS, --threads THREADS    Parallel workers (default: auto-detect, respects SLURM/cgroup)
   -v, --version
 ```
 

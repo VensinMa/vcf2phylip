@@ -6,7 +6,7 @@ Convert SNPs in VCF format into PHYLIP, FASTA, NEXUS, or binary NEXUS
 matrices for phylogenetic analysis.
 
 Multithreaded edition preserving the command-line behavior of vcf2phylip v2.9
-with ``-t/--threads`` (default=0, auto-detect CPU cores). VCF chunks are
+with ``-t/--threads`` (default: auto-detect CPU cores). VCF chunks are
 parsed with multiple worker processes; final sample sequences are assembled
 from transposed blocks stored during Phase 1, avoiding a full-file scan per
 sample.
@@ -17,7 +17,7 @@ Any ploidy is allowed, but binary NEXUS is produced only for diploid VCFs.
 __author__      = "Edgardo M. Ortiz"
 __credits__     = "Juan D. Palacio-Mejía"
 __modifier__    = "Ma Wenxin"
-__version__     = "2.9-mt2"
+__version__     = "2.9-mt3"
 __email__       = "e.ortiz.v@gmail.com"
 __date__        = "2026-07-22"
 
@@ -276,17 +276,58 @@ def assemble_sample(sample_index, nt_temp_path, nt_blocks, bin_temp_path, bin_bl
 # ---------------------------------------------------------------------------
 
 def positive_int(value):
-    """argparse validator for non-negative integers."""
+    """argparse validator for positive integers."""
     try:
         integer = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be an integer") from exc
-    if integer < 0:
-        raise argparse.ArgumentTypeError("must be >= 0 (0 = auto-detect CPU cores)")
+    if integer < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
     return integer
 
 
+def detect_cpu_count():
+    """Detect CPUs available to this process, including scheduler limits."""
+    constraints = []
+
+    # Batch schedulers may expose fewer CPUs than the physical node contains.
+    for variable in ("SLURM_CPUS_PER_TASK", "PBS_NP", "NSLOTS", "LSB_DJOB_NUMPROC"):
+        raw_value = os.environ.get(variable)
+        if not raw_value:
+            continue
+        try:
+            value = int(raw_value)
+        except ValueError:
+            continue
+        if value > 0:
+            constraints.append((value, variable))
+
+    # Linux/WSL CPU affinity normally reflects cpuset or scheduler binding.
+    try:
+        affinity_count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity_count = 0
+    if affinity_count > 0:
+        constraints.append((affinity_count, "CPU affinity"))
+
+    # Python 3.13+ provides a process-aware count on supported platforms.
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if process_cpu_count is not None:
+        detected = process_cpu_count()
+        if detected:
+            constraints.append((detected, "os.process_cpu_count()"))
+
+    if constraints:
+        cpu_count = min(value for value, _ in constraints)
+        sources = ", ".join(name for value, name in constraints if value == cpu_count)
+        return max(1, cpu_count), sources
+
+    return max(1, os.cpu_count() or 1), "os.cpu_count()"
+
+
 def main():
+    auto_threads, auto_threads_source = detect_cpu_count()
+
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-i", "--input",
@@ -346,16 +387,18 @@ def main():
                "(disabled by default)")
     parser.add_argument("-t", "--threads",
         type = positive_int,
-        default = 0,
-        help = "Number of parallel processes (default=0, auto-detect CPU cores)")
+        default = None,
+        help = ("Parallel workers for parsing/output "
+                "(default: auto-detect available CPUs; currently {})".format(
+                    auto_threads)))
     parser.add_argument("-v", "--version",
         action = "version",
         version = "%(prog)s {version}".format(version=__version__))
     args = parser.parse_args()
 
-    # Auto-detect CPU cores if threads=0
-    if args.threads <= 0:
-        args.threads = os.cpu_count() or 1
+    threads_auto_detected = args.threads is None
+    if threads_auto_detected:
+        args.threads = auto_threads
 
     outgroup = args.outgroup.split(",")[0].split(";")[0]
     need_nt = args.fasta or args.nexus or not args.phylipdisable
@@ -374,7 +417,11 @@ def main():
         sys.exit(1)
     print("\nConverting file '{}':\n".format(args.filename))
     print("Number of samples in VCF: {:d}".format(num_samples))
-    print("Parallel workers: {:d}".format(args.threads))
+    if threads_auto_detected:
+        print("Parallel workers: {:d} (auto-detected from {})".format(
+            args.threads, auto_threads_source))
+    else:
+        print("Parallel workers: {:d} (user specified)".format(args.threads))
 
     # If the 'min_samples_locus' is larger than the actual number of samples in VCF readjust it
     args.min_samples_locus = min(num_samples, args.min_samples_locus)
