@@ -285,12 +285,16 @@ def main():
         action = "store",
         dest = "threads",
         type = int,
-        default = 1,
-        help = "Number of parallel processes (default=1, i.e. original single-threaded behavior)")
+        default = 0,
+        help = "Number of parallel processes (default=0, auto-detect CPU cores)")
     parser.add_argument("-v", "--version",
         action = "version",
         version = "%(prog)s {version}".format(version=__version__))
     args = parser.parse_args()
+
+    # Auto-detect CPU cores if threads=0
+    if args.threads <= 0:
+        args.threads = os.cpu_count() or 1
 
     outgroup = args.outgroup.split(",")[0].split(";")[0]
 
