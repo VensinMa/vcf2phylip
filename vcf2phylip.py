@@ -31,7 +31,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 # Target amount of VCF text submitted to each parsing task.
-CHUNK_TARGET_BYTES = 4 * 1024 * 1024
+CHUNK_TARGET_BYTES = 32 * 1024 * 1024
 
 # Dictionary of IUPAC ambiguities for nucleotides
 AMBIG = {

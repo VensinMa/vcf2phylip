@@ -12,7 +12,7 @@ Added `-t / --threads` parameter for multiprocessing. All other parameters and o
 
 | Stage | Description |
 |-------|-------------|
-| **Phase 1** | VCF parsing + genotype conversion — 4MB byte-based chunks, streamed with backpressure via `ProcessPoolExecutor` |
+| **Phase 1** | VCF parsing + genotype conversion — 32MB byte-based chunks, streamed with backpressure via `ProcessPoolExecutor` |
 | **Phase 2** | Matrix assembly — transposed blocks written during Phase 1, per-sample `seek()` via `ThreadPoolExecutor` |
 
 ## Usage
