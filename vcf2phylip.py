@@ -2,37 +2,38 @@
 # -*- coding: utf-8 -*-
 
 """
-The script converts a collection of SNPs in VCF format into a PHYLIP, FASTA,
-NEXUS, or binary NEXUS file for phylogenetic analysis. The code is optimized
-to process VCF files with sizes >1GB. For small VCF files the algorithm slows
-down as the number of taxa increases (but is still fast).
+Convert SNPs in VCF format into PHYLIP, FASTA, NEXUS, or binary NEXUS
+matrices for phylogenetic analysis.
+
+Multithreaded edition preserving the command-line behavior of vcf2phylip v2.9
+with ``-t/--threads`` (default=0, auto-detect CPU cores). VCF chunks are
+parsed with multiple worker processes; final sample sequences are assembled
+from transposed blocks stored during Phase 1, avoiding a full-file scan per
+sample.
 
 Any ploidy is allowed, but binary NEXUS is produced only for diploid VCFs.
-
-Multithreaded version based on vcf2phylip v2.9 by Edgardo M. Ortiz.
-Parallelized:
-  - Phase 1: VCF parsing and genotype conversion (multiprocessing batches)
-  - Phase 2: Matrix transposition and output writing (multiprocessing per sample)
 """
 
 __author__      = "Edgardo M. Ortiz"
 __credits__     = "Juan D. Palacio-Mejía"
-__version__     = "2.9-parallel"
+__modifier__    = "Ma Wenxin"
+__version__     = "2.9-mt2"
 __email__       = "e.ortiz.v@gmail.com"
-__date__        = "2023-07-07"
+__date__        = "2026-07-22"
 
 import argparse
 import gzip
 import os
 import random
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
+# Target amount of VCF text submitted to each parsing task.
+CHUNK_TARGET_BYTES = 4 * 1024 * 1024
+
 # Dictionary of IUPAC ambiguities for nucleotides
-# '*' is a deletion in GATK, deletions are ignored in consensus, lowercase consensus is used when an
-# 'N' or '*' is part of the genotype. Capitalization is used by some software but ignored by Geneious
-# for example
 AMBIG = {
     "A"    :"A", "C"    :"C", "G"    :"G", "N"    :"N", "T"    :"T",
     "*A"   :"a", "*C"   :"c", "*G"   :"g", "*N"   :"n", "*T"   :"t",
@@ -50,9 +51,6 @@ AMBIG = {
 }
 
 # Dictionary for translating biallelic SNPs into SNAPP, only for diploid VCF
-# 0 is homozygous reference
-# 1 is heterozygous
-# 2 is homozygous alternative
 GEN_BIN = {
     "./.":"?",
     ".|.":"?",
@@ -68,13 +66,8 @@ GEN_BIN = {
 
 
 def extract_sample_names(vcf_file):
-    """
-    Extract sample names from VCF file
-    """
-    if vcf_file.lower().endswith(".gz"):
-        opener = gzip.open
-    else:
-        opener = open
+    """Extract sample names from the #CHROM line of a VCF file."""
+    opener = gzip.open if vcf_file.lower().endswith(".gz") else open
     sample_names = []
     with opener(vcf_file, "rt") as vcf:
         for line in vcf:
@@ -87,45 +80,31 @@ def extract_sample_names(vcf_file):
 
 
 def is_anomalous(record, num_samples):
-    """
-    Determine if the number of samples in current record corresponds to number of samples described
-    in the line '#CHROM'
-    """
-    return bool(len(record) != num_samples + 9)
+    """Return True when a VCF row has an unexpected number of columns."""
+    return len(record) != num_samples + 9
 
 
 def is_snp(record):
-    """
-    Determine if current VCF record is a SNP (single nucleotide polymorphism) as opposed to MNP
-    (multinucleotide polymorphism)
-    """
-    # <NON_REF> must be replaced by the REF in the ALT field for GVCFs from GATK
+    """Return True for single-nucleotide REF/ALT alleles."""
     alt = record[4].replace("<NON_REF>", record[3])
-    return bool(len(record[3]) == 1 and len(alt) - alt.count(",") == alt.count(",") + 1)
+    return len(record[3]) == 1 and len(alt) - alt.count(",") == alt.count(",") + 1
 
 
 def num_genotypes(record, num_samples):
-    """
-    Get number of genotypes in VCF record, total number of samples - missing genotypes
-    """
-    missing = 0
-    for i in range(9, num_samples + 9):
-        if record[i].startswith("."):
-            missing += 1
+    """Count samples whose genotype field does not start with a missing allele."""
+    missing = sum(1 for field in record[9:num_samples + 9] if field.startswith("."))
     return num_samples - missing
 
 
-def get_matrix_column(record, num_samples, resolve_IUPAC):
-    """
-    Transform a VCF record into a phylogenetic matrix column with nucleotides instead of numbers
-    """
-    nt_dict = {str(0): record[3].replace("-","*").upper(), ".": "N"}
-    # <NON_REF> must be replaced by the REF in the ALT field for GVCFs from GATK
+def get_matrix_column(record, num_samples, resolve_IUPAC, rng=None):
+    """Transform one VCF record into one nucleotide matrix column."""
+    nt_dict = {str(0): record[3].replace("-", "*").upper(), ".": "N"}
     alt = record[4].replace("-", "*").replace("<NON_REF>", nt_dict["0"])
     alt = alt.split(",")
     for n in range(len(alt)):
-        nt_dict[str(n+1)] = alt[n]
+        nt_dict[str(n + 1)] = alt[n]
     column = ""
+    choose = random.choice if rng is None else rng.choice
     for i in range(9, num_samples + 9):
         geno_num = record[i].split(":")[0].replace("/", "").replace("|", "")
         try:
@@ -135,15 +114,12 @@ def get_matrix_column(record, num_samples, resolve_IUPAC):
         if resolve_IUPAC is False:
             column += AMBIG[geno_nuc]
         else:
-            column += AMBIG[nt_dict[random.choice(geno_num)]]
+            column += AMBIG[nt_dict[choose(geno_num)]]
     return column
 
 
 def get_matrix_column_bin(record, num_samples):
-    """
-    Return an alignment column in NEXUS binary from a VCF record, if genotype is not diploid with at
-    most two alleles it will return '?' as state
-    """
+    """Return one binary NEXUS column; unsupported genotypes become '?'."""
     column = ""
     for i in range(9, num_samples + 9):
         genotype = record[i].split(":")[0]
@@ -154,73 +130,160 @@ def get_matrix_column_bin(record, num_samples):
     return column
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Worker functions for multiprocessing
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Phase 1 helpers — VCF parsing
+# ---------------------------------------------------------------------------
 
-def _process_lines_chunk(args):
-    """
-    Process a batch of VCF data lines (already stripped/split).
-    Returns list of tuples: (site_tmp_or_None, binsite_tmp_or_None, is_accepted,
-                              is_shallow, is_mnp, is_biallelic, chrom, pos,
-                              num_samples_locus, line_text_for_error)
-    """
-    (lines, num_samples, min_samples_locus, resolve_IUPAC, write_nucleotide,
-     write_binary) = args
+def iter_vcf_chunks(vcf, target_bytes=CHUNK_TARGET_BYTES):
+    """Yield bounded lists of VCF lines without loading the full file."""
+    chunk = []
+    size = 0
+    for line in vcf:
+        chunk.append(line)
+        size += len(line)
+        if size >= target_bytes:
+            yield chunk
+            chunk = []
+            size = 0
+    if chunk:
+        yield chunk
 
-    results = []
+
+def process_vcf_chunk(lines, num_samples, min_samples_locus, need_nt,
+                      need_bin, resolve_iupac, write_used, random_seed=None):
+    """Parse one VCF chunk. Safe to run in a worker process."""
+    rng = random.Random(random_seed) if random_seed is not None else None
+
+    nt_rows = []
+    bin_rows = []
+    used_rows = []
+    malformed_lines = []
+
+    snp_num = 0
+    snp_accepted = 0
+    snp_shallow = 0
+    mnp_num = 0
+    snp_biallelic = 0
+
     for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
         record = line.split("\t")
+        snp_num += 1
 
         if is_anomalous(record, num_samples):
-            results.append((None, None, False, False, False, False, None, None, 0, line))
+            malformed_lines.append(line)
             continue
 
         num_samples_locus = num_genotypes(record, num_samples)
         if num_samples_locus < min_samples_locus:
-            results.append((None, None, False, True, False, False, None, None, num_samples_locus, None))
+            snp_shallow += 1
             continue
 
         if not is_snp(record):
-            results.append((None, None, False, False, True, False, None, None, num_samples_locus, None))
+            mnp_num += 1
             continue
 
-        # Passed filters — it's an accepted SNP
-        site_tmp = None
-        if write_nucleotide:
-            site_tmp = get_matrix_column(record, num_samples, resolve_IUPAC)
+        # If nucleotide matrices are requested and genotype cannot be decoded,
+        # skip this site for all outputs (preserves v2.9 behavior).
+        if need_nt:
+            site_tmp = get_matrix_column(record, num_samples, resolve_iupac, rng)
             if site_tmp == "malformed":
-                results.append((None, None, False, False, False, False, None, None, 0, line))
+                malformed_lines.append(line)
                 continue
+            snp_accepted += 1
+            nt_rows.append(site_tmp)
+            if write_used:
+                used_rows.append((record[0], record[1], num_samples_locus))
 
-        binsite_tmp = None
-        is_biallelic = False
-        if write_binary and len(record[4]) == 1:
-            binsite_tmp = get_matrix_column_bin(record, num_samples)
-            is_biallelic = True
+        if need_bin and len(record[4]) == 1:
+            snp_biallelic += 1
+            bin_rows.append(get_matrix_column_bin(record, num_samples))
 
-        chrom = record[0]
-        pos = record[1]
-        results.append((site_tmp, binsite_tmp, True, False, False, is_biallelic,
-                         chrom, pos, num_samples_locus, None))
-
-    return results
+    counters = (snp_num, snp_accepted, snp_shallow, mnp_num, snp_biallelic)
+    return nt_rows, bin_rows, used_rows, malformed_lines, counters
 
 
-def _extract_sample_sequences(args):
+def ordered_parallel_results(chunks, workers, task_args, resolve_iupac):
+    """Run chunk tasks in parallel while yielding results in input order."""
+    max_pending = max(1, workers * 2)
+    pending = deque()
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for chunk in chunks:
+            seed = random.getrandbits(64) if resolve_iupac else None
+            future = executor.submit(process_vcf_chunk, chunk, *task_args, seed)
+            pending.append(future)
+            if len(pending) >= max_pending:
+                yield pending.popleft().result()
+
+        while pending:
+            yield pending.popleft().result()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 helpers — transposed-block assembly
+# ---------------------------------------------------------------------------
+
+def write_transposed_block(handle, rows, num_samples):
     """
-    Worker for Phase 2: read the temp file and extract characters at given sample indices.
-    Returns dict: {sample_index: sequence_string}
+    Store one row-major matrix chunk as a sample-major block.
+
+    Returns (block_start_offset, sites_in_block). The final sequence for sample
+    s can later be read from offset + s * sites_in_block.
     """
-    tmp_path, sample_indices = args
-    seqs = {idx: [] for idx in sample_indices}
-    with open(tmp_path, "r") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            for idx in sample_indices:
-                if idx < len(line):
-                    seqs[idx].append(line[idx])
-    return {idx: "".join(chars) for idx, chars in seqs.items()}
+    if not rows:
+        return None
+
+    width = len(rows)
+    for row in rows:
+        if len(row) != num_samples:
+            raise ValueError("Internal error: matrix row width does not match sample count")
+
+    start = handle.tell()
+    for sample_chars in zip(*rows):
+        handle.write("".join(sample_chars).encode("ascii"))
+    return start, width
+
+
+def assemble_sequence(temp_path, blocks, sample_index):
+    """Assemble one sample sequence from transposed temporary blocks."""
+    if temp_path is None or not blocks:
+        return ""
+
+    sequence = bytearray()
+    with open(temp_path, "rb") as handle:
+        for start, width in blocks:
+            handle.seek(start + sample_index * width)
+            data = handle.read(width)
+            if len(data) != width:
+                raise OSError("Temporary matrix ended unexpectedly")
+            sequence.extend(data)
+    return sequence.decode("ascii")
+
+
+def assemble_sample(sample_index, nt_temp_path, nt_blocks, bin_temp_path, bin_blocks):
+    """Assemble nucleotide and/or binary sequences for one sample."""
+    nt_seq = assemble_sequence(nt_temp_path, nt_blocks, sample_index)
+    bin_seq = assemble_sequence(bin_temp_path, bin_blocks, sample_index)
+    return sample_index, nt_seq, bin_seq
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def positive_int(value):
+    """argparse validator for non-negative integers."""
+    try:
+        integer = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if integer < 0:
+        raise argparse.ArgumentTypeError("must be >= 0 (0 = auto-detect CPU cores)")
+    return integer
 
 
 def main():
@@ -282,9 +345,7 @@ def main():
         help = "Save the list of coordinates that passed the filters and were used in the alignments "
                "(disabled by default)")
     parser.add_argument("-t", "--threads",
-        action = "store",
-        dest = "threads",
-        type = int,
+        type = positive_int,
         default = 0,
         help = "Number of parallel processes (default=0, auto-detect CPU cores)")
     parser.add_argument("-v", "--version",
@@ -297,28 +358,30 @@ def main():
         args.threads = os.cpu_count() or 1
 
     outgroup = args.outgroup.split(",")[0].split(";")[0]
+    need_nt = args.fasta or args.nexus or not args.phylipdisable
+    need_bin = args.nexusbin
 
     # Get samples names and number of samples in VCF
-    if Path(args.filename).exists():
-        sample_names = extract_sample_names(args.filename)
-    else:
+    input_path = Path(args.filename)
+    if not input_path.exists():
         print("\nInput VCF file not found, please verify the provided path")
-        sys.exit()
+        sys.exit(1)
+
+    sample_names = extract_sample_names(args.filename)
     num_samples = len(sample_names)
     if num_samples == 0:
         print("\nSample names not found in VCF, your file may be corrupt or missing the header.\n")
-        sys.exit()
+        sys.exit(1)
     print("\nConverting file '{}':\n".format(args.filename))
     print("Number of samples in VCF: {:d}".format(num_samples))
-    if args.threads > 1:
-        print("Using {:d} parallel processes".format(args.threads))
+    print("Parallel workers: {:d}".format(args.threads))
 
     # If the 'min_samples_locus' is larger than the actual number of samples in VCF readjust it
     args.min_samples_locus = min(num_samples, args.min_samples_locus)
 
     # Output filename will be the same as input file, indicating the minimum of samples specified
     if not args.prefix:
-        parts = Path(args.filename).name.split(".")
+        parts = input_path.name.split(".")
         args.prefix = []
         for p in parts:
             if p.lower() == "vcf":
@@ -329,406 +392,229 @@ def main():
     args.prefix += ".min" + str(args.min_samples_locus)
 
     # Check if outfolder exists, create it if it doesn't
-    if not Path(args.folder).exists():
-        Path(args.folder).mkdir(parents=True)
+    output_folder = Path(args.folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    outfile = str(output_folder / args.prefix)
 
-    outfile = str(Path(args.folder, args.prefix))
+    # Temp file paths and block index lists for Phase 2 assembly
+    nt_temp_path = outfile + ".tmp" if need_nt else None
+    bin_temp_path = outfile + ".bin.tmp" if need_bin else None
+    nt_blocks = []
+    bin_blocks = []
 
-    # Flags for which outputs are needed
-    write_nucleotide = args.fasta or args.nexus or not args.phylipdisable
-    write_binary = args.nexusbin
+    # Resource handles — all cleaned up in finally
+    used_sites = None
+    nt_temp = None
+    bin_temp = None
 
+    try:
+        if args.write_used:
+            used_sites = open(outfile + ".used_sites.tsv", "w", encoding="utf-8")
+            used_sites.write("#CHROM\tPOS\tNUM_SAMPLES\n")
+        if need_nt:
+            nt_temp = open(nt_temp_path, "wb")
+        if need_bin:
+            bin_temp = open(bin_temp_path, "wb")
 
-    ##########################
-    # PROCESS GENOTYPES IN VCF (Phase 1)
+        ##########################
+        # PROCESS GENOTYPES IN VCF
 
-    # We need to create an intermediate file to hold the sequence data vertically and then transpose
-    # it to create the matrices
-    if write_nucleotide:
-        temporal = open(outfile+".tmp", "w")
+        opener = gzip.open if args.filename.lower().endswith(".gz") else open
 
-    # If binary NEXUS is selected also create a separate temporal
-    if write_binary:
-        temporalbin = open(outfile+".bin.tmp", "w")
+        snp_num = 0
+        snp_accepted = 0
+        snp_shallow = 0
+        mnp_num = 0
+        snp_biallelic = 0
+        next_progress = 500000
 
-    if args.write_used:
-        used_sites = open(outfile+".used_sites.tsv", "w")
-        used_sites.write("#CHROM\tPOS\tNUM_SAMPLES\n")
+        task_args = (
+            num_samples,
+            args.min_samples_locus,
+            need_nt,
+            need_bin,
+            args.resolve_IUPAC,
+            args.write_used,
+        )
 
-    if args.filename.lower().endswith(".gz"):
-        opener = gzip.open
-    else:
-        opener = open
-
-    # Counters
-    snp_num = 0
-    snp_accepted = 0
-    snp_shallow = 0
-    mnp_num = 0
-    snp_biallelic = 0
-
-    BATCH_SIZE = 10000  # Lines per batch for parallel processing
-
-    if args.threads <= 1:
-        # ── Original single-threaded path ──
         with opener(args.filename, "rt") as vcf:
-            while 1:
-                vcf_chunk = vcf.readlines(50000)
-                if not vcf_chunk:
-                    break
+            chunks = iter_vcf_chunks(vcf)
+            if args.threads == 1:
+                results = (
+                    process_vcf_chunk(chunk, *task_args, None)
+                    for chunk in chunks
+                )
+            else:
+                results = ordered_parallel_results(
+                    chunks, args.threads, task_args, args.resolve_IUPAC)
 
-                for line in vcf_chunk:
-                    line = line.strip()
+            for nt_rows, bin_rows, used_rows, malformed_lines, counters in results:
+                for malformed in malformed_lines:
+                    print("Skipping malformed line:\n{}".format(malformed))
 
-                    if line and not line.startswith("#"):
-                        record = line.split("\t")
-                        snp_num += 1
-                        if snp_num % 500000 == 0:
-                            print("{:d} genotypes processed.".format(snp_num))
-                        if is_anomalous(record, num_samples):
-                            print("Skipping malformed line:\n{}".format(line))
-                            continue
-                        else:
-                            num_samples_locus = num_genotypes(record, num_samples)
-                            if num_samples_locus < args.min_samples_locus:
-                                snp_shallow += 1
-                                continue
-                            else:
-                                if is_snp(record):
-                                    if write_nucleotide:
-                                        site_tmp = get_matrix_column(record, num_samples,
-                                                                     args.resolve_IUPAC)
-                                        if site_tmp == "malformed":
-                                            print("Skipping malformed line:\n{}".format(line))
-                                            continue
-                                        else:
-                                            snp_accepted += 1
-                                            temporal.write(site_tmp+"\n")
-                                            if args.write_used:
-                                                used_sites.write(record[0] + "\t"
-                                                                 + record[1] + "\t"
-                                                                 + str(num_samples_locus) + "\n")
-                                    if write_binary:
-                                        if len(record[4]) == 1:
-                                            snp_biallelic += 1
-                                            binsite_tmp = get_matrix_column_bin(record, num_samples)
-                                            temporalbin.write(binsite_tmp+"\n")
-                                else:
-                                    mnp_num += 1
+                c_total, c_accepted, c_shallow, c_mnp, c_biallelic = counters
+                snp_num += c_total
+                snp_accepted += c_accepted
+                snp_shallow += c_shallow
+                mnp_num += c_mnp
+                snp_biallelic += c_biallelic
 
-    else:
-        # ── Parallel path ──
-        with opener(args.filename, "rt") as vcf:
-            batch = []
-            futures = []
-            write_nucleotide_flag = write_nucleotide
-            write_binary_flag = write_binary
+                while snp_num >= next_progress:
+                    print("{:d} genotypes processed.".format(next_progress))
+                    next_progress += 500000
 
-            with ProcessPoolExecutor(max_workers=args.threads) as executor:
-                # Read and submit batches
-                while True:
-                    vcf_chunk = vcf.readlines(50000)
-                    if not vcf_chunk:
-                        break
+                # Write transposed blocks to temp files
+                if nt_rows:
+                    block = write_transposed_block(nt_temp, nt_rows, num_samples)
+                    nt_blocks.append(block)
+                if bin_rows:
+                    block = write_transposed_block(bin_temp, bin_rows, num_samples)
+                    bin_blocks.append(block)
+                if used_sites is not None:
+                    for chrom, pos, present in used_rows:
+                        used_sites.write("{}\t{}\t{}\n".format(chrom, pos, present))
 
-                    for line in vcf_chunk:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            batch.append(line)
+        # Close Phase 1 temp/output files before Phase 2
+        if nt_temp is not None:
+            nt_temp.close()
+            nt_temp = None
+        if bin_temp is not None:
+            bin_temp.close()
+            bin_temp = None
+        if used_sites is not None:
+            used_sites.close()
+            used_sites = None
 
-                            if len(batch) >= BATCH_SIZE:
-                                futures.append(executor.submit(
-                                    _process_lines_chunk,
-                                    (batch, num_samples, args.min_samples_locus,
-                                     args.resolve_IUPAC, write_nucleotide_flag,
-                                     write_binary_flag)
-                                ))
-                                batch = []
+        # Print useful information about filtering of SNPs
+        print("Total of genotypes processed: {:d}".format(snp_num))
+        print("Genotypes excluded because they exceeded the amount "
+              "of missing data allowed: {:d}".format(snp_shallow))
+        print("Genotypes that passed missing data filter but were "
+              "excluded for being MNPs: {:d}".format(mnp_num))
+        print("SNPs that passed the filters: {:d}".format(snp_accepted))
+        if need_bin:
+            print("Biallelic SNPs selected for binary NEXUS: {:d}".format(snp_biallelic))
+        if args.write_used:
+            print("Used sites saved to: '" + outfile + ".used_sites.tsv'")
+        print("")
 
-                # Submit remaining lines
-                if batch:
-                    futures.append(executor.submit(
-                        _process_lines_chunk,
-                        (batch, num_samples, args.min_samples_locus,
-                         args.resolve_IUPAC, write_nucleotide_flag,
-                         write_binary_flag)
-                    ))
+        #######################
+        # WRITE OUTPUT MATRICES
 
-                # Collect results IN ORDER (futures are in submission order)
-                for future in futures:
-                    results = future.result()
-                    for (site_tmp, binsite_tmp, accepted, shallow, mnp, biallelic,
-                         chrom, pos, num_samples_locus, error_line) in results:
+        output_phy = open(outfile + ".phy", "w", encoding="utf-8") if not args.phylipdisable else None
+        output_fas = open(outfile + ".fasta", "w", encoding="utf-8") if args.fasta else None
+        output_nex = open(outfile + ".nexus", "w", encoding="utf-8") if args.nexus else None
+        output_nexbin = open(outfile + ".bin.nexus", "w", encoding="utf-8") if args.nexusbin else None
 
-                        snp_num += 1
-                        if snp_num % 500000 == 0:
-                            print("{:d} genotypes processed.".format(snp_num))
+        try:
+            if output_phy is not None:
+                output_phy.write("{:d} {:d}\n".format(num_samples, snp_accepted))
+            if output_nex is not None:
+                output_nex.write("#NEXUS\n\nBEGIN DATA;\n\tDIMENSIONS NTAX={:d} NCHAR={:d};\n\tFORMAT "
+                                 "DATATYPE=DNA MISSING=N GAP=- ;\nMATRIX\n".format(num_samples, snp_accepted))
+            if output_nexbin is not None:
+                output_nexbin.write("#NEXUS\n\nBEGIN DATA;\n\tDIMENSIONS NTAX={:d} NCHAR={:d};\n\tFORMAT "
+                                    "DATATYPE=SNP MISSING=? GAP=- ;\nMATRIX\n".format(num_samples, snp_biallelic))
 
-                        if error_line is not None:
-                            print("Skipping malformed line:\n{}".format(error_line))
-                            continue
+            # Get length of longest sequence name
+            len_longest_name = max(len(name) for name in sample_names)
 
-                        if shallow:
-                            snp_shallow += 1
-                            continue
+            # Write outgroup as first sequence in alignment if the name is specified
+            idx_outgroup = sample_names.index(outgroup) if outgroup in sample_names else None
 
-                        if mnp:
-                            mnp_num += 1
-                            continue
+            # Build ordered sample list: outgroup first, then ingroup
+            sample_order = []
+            if idx_outgroup is not None:
+                sample_order.append(idx_outgroup)
+            sample_order.extend(i for i in range(num_samples) if i != idx_outgroup)
 
-                        if accepted:
-                            if site_tmp is not None and write_nucleotide:
-                                snp_accepted += 1
-                                temporal.write(site_tmp + "\n")
-                                if args.write_used:
-                                    used_sites.write(chrom + "\t" + pos + "\t"
-                                                     + str(num_samples_locus) + "\n")
-                            if binsite_tmp is not None and write_binary:
-                                snp_biallelic += 1
-                                temporalbin.write(binsite_tmp + "\n")
-
-    # Print useful information about filtering of SNPs
-    print("Total of genotypes processed: {:d}".format(snp_num))
-    print("Genotypes excluded because they exceeded the amount "
-          "of missing data allowed: {:d}".format(snp_shallow))
-    print("Genotypes that passed missing data filter but were "
-          "excluded for being MNPs: {:d}".format(mnp_num))
-    print("SNPs that passed the filters: {:d}".format(snp_accepted))
-    if write_binary:
-        print("Biallelic SNPs selected for binary NEXUS: {:d}".format(snp_biallelic))
-
-    if args.write_used:
-        print("Used sites saved to: '" + outfile + ".used_sites.tsv'")
-        used_sites.close()
-    print("")
-
-    if write_nucleotide:
-        temporal.close()
-    if write_binary:
-        temporalbin.close()
-
-
-    #######################
-    # WRITE OUTPUT MATRICES (Phase 2)
-
-    if not args.phylipdisable:
-        output_phy = open(outfile+".phy", "w")
-        output_phy.write("{:d} {:d}\n".format(len(sample_names), snp_accepted))
-
-    if args.fasta:
-        output_fas = open(outfile+".fasta", "w")
-
-    if args.nexus:
-        output_nex = open(outfile+".nexus", "w")
-        output_nex.write("#NEXUS\n\nBEGIN DATA;\n\tDIMENSIONS NTAX={:d} NCHAR={:d};\n\tFORMAT "
-                         "DATATYPE=DNA MISSING=N GAP=- ;\nMATRIX\n".format(len(sample_names),
-                                                                                      snp_accepted))
-
-    if write_binary:
-        output_nexbin = open(outfile+".bin.nexus", "w")
-        output_nexbin.write("#NEXUS\n\nBEGIN DATA;\n\tDIMENSIONS NTAX={:d} NCHAR={:d};\n\tFORMAT "
-                            "DATATYPE=SNP MISSING=? GAP=- ;\nMATRIX\n".format(len(sample_names),
-                                                                                     snp_biallelic))
-
-    # Get length of longest sequence name
-    len_longest_name = 0
-    for name in sample_names:
-        if len(name) > len_longest_name:
-            len_longest_name = len(name)
-
-    # Write outgroup as first sequence in alignment if the name is specified
-    idx_outgroup = None
-    if outgroup in sample_names:
-        idx_outgroup = sample_names.index(outgroup)
-
-    if args.threads <= 1 or (not write_nucleotide and not write_binary):
-        # ── Original single-threaded transpose path ──
-        if idx_outgroup is not None:
-            if write_nucleotide:
-                with open(outfile+".tmp") as tmp_seq:
-                    seqout = ""
-                    for line in tmp_seq:
-                        seqout += line[idx_outgroup]
-                if args.fasta:
-                    output_fas.write(">"+sample_names[idx_outgroup]+"\n"+seqout+"\n")
-                padding = (len_longest_name + 3 - len(sample_names[idx_outgroup])) * " "
-                if not args.phylipdisable:
-                    output_phy.write(sample_names[idx_outgroup]+padding+seqout+"\n")
-                if args.nexus:
-                    output_nex.write(sample_names[idx_outgroup]+padding+seqout+"\n")
-                print("Outgroup, '{}', added to the matrix(ces).".format(outgroup))
-
-            if write_binary:
-                with open(outfile+".bin.tmp") as bin_tmp_seq:
-                    seqout = ""
-                    for line in bin_tmp_seq:
-                        seqout += line[idx_outgroup]
-                padding = (len_longest_name + 3 - len(sample_names[idx_outgroup])) * " "
-                output_nexbin.write(sample_names[idx_outgroup]+padding+seqout+"\n")
-                print("Outgroup, '{}', added to the binary matrix.".format(outgroup))
-
-        for s in range(0, len(sample_names)):
-            if s != idx_outgroup:
-                if write_nucleotide:
-                    with open(outfile+".tmp") as tmp_seq:
-                        seqout = ""
-                        for line in tmp_seq:
-                            seqout += line[s]
-                    if args.fasta:
-                        output_fas.write(">"+sample_names[s]+"\n"+seqout+"\n")
-                    padding = (len_longest_name + 3 - len(sample_names[s])) * " "
-                    if not args.phylipdisable:
-                        output_phy.write(sample_names[s]+padding+seqout+"\n")
-                    if args.nexus:
-                        output_nex.write(sample_names[s]+padding+seqout+"\n")
-                    print("Sample {:d} of {:d}, '{}', added to the nucleotide matrix(ces).".format(
-                                                           s+1, len(sample_names), sample_names[s]))
-
-                if write_binary:
-                    with open(outfile+".bin.tmp") as bin_tmp_seq:
-                        seqout = ""
-                        for line in bin_tmp_seq:
-                            seqout += line[s]
-                    padding = (len_longest_name + 3 - len(sample_names[s])) * " "
-                    output_nexbin.write(sample_names[s]+padding+seqout+"\n")
-                    print("Sample {:d} of {:d}, '{}', added to the binary matrix.".format(
-                                                           s+1, len(sample_names), sample_names[s]))
-
-    else:
-        # ── Parallel transpose path ──
-        # Build ordered list of sample indices to process
-        sample_order = []
-        if idx_outgroup is not None:
-            sample_order.append(idx_outgroup)
-        for s in range(len(sample_names)):
-            if s != idx_outgroup:
-                sample_order.append(s)
-
-        def write_sample_seq(sample_idx, seqout, is_outgroup=False):
-            """Write a single sample's sequence to all enabled output files."""
-            tag = "Outgroup" if is_outgroup else "Sample"
-            if write_nucleotide:
-                if args.fasta:
-                    output_fas.write(">"+sample_names[sample_idx]+"\n"+seqout+"\n")
-                padding = (len_longest_name + 3 - len(sample_names[sample_idx])) * " "
-                if not args.phylipdisable:
-                    output_phy.write(sample_names[sample_idx]+padding+seqout+"\n")
-                if args.nexus:
-                    output_nex.write(sample_names[sample_idx]+padding+seqout+"\n")
-                if is_outgroup:
-                    print("Outgroup, '{}', added to the matrix(ces).".format(outgroup))
-                else:
-                    print("Sample, '{}', added to the nucleotide matrix(ces).".format(
-                              sample_names[sample_idx]))
-            if write_binary:
-                padding = (len_longest_name + 3 - len(sample_names[sample_idx])) * " "
-                output_nexbin.write(sample_names[sample_idx]+padding+seqout+"\n")
-                if is_outgroup:
-                    print("Outgroup, '{}', added to the binary matrix.".format(outgroup))
-                else:
-                    print("Sample, '{}', added to the binary matrix.".format(
-                              sample_names[sample_idx]))
-
-        # Read temp files once and extract all sequences in parallel
-        num_workers = min(args.threads, len(sample_order))
-
-        # ── Nucleotide matrix ──
-        if write_nucleotide and Path(outfile+".tmp").exists():
-            print("Transposing nucleotide matrix with {:d} workers...".format(num_workers))
-
-            # Split sample_order into chunks for workers
-            chunks = [[] for _ in range(num_workers)]
-            for i, idx in enumerate(sample_order):
-                chunks[i % num_workers].append(idx)
-
-            # Filter out empty chunks
-            chunks = [c for c in chunks if c]
-
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures_map = {}
-                for chunk in chunks:
-                    future = executor.submit(_extract_sample_sequences,
-                                             (outfile+".tmp", chunk))
-                    futures_map[future] = chunk
-
-                # Collect all sequences
-                all_seqs = {}
-                for future in as_completed(futures_map):
-                    result = future.result()
-                    all_seqs.update(result)
-
-            # Write in original order
-            for idx in sample_order:
-                is_outgroup = (idx == idx_outgroup)
-                seqout = all_seqs.get(idx, "")
-                if write_nucleotide:
-                    if args.fasta:
-                        output_fas.write(">"+sample_names[idx]+"\n"+seqout+"\n")
-                    padding = (len_longest_name + 3 - len(sample_names[idx])) * " "
-                    if not args.phylipdisable:
-                        output_phy.write(sample_names[idx]+padding+seqout+"\n")
-                    if args.nexus:
-                        output_nex.write(sample_names[idx]+padding+seqout+"\n")
-                    if is_outgroup:
-                        print("Outgroup, '{}', added to the matrix(ces).".format(outgroup))
+            # Assemble sequences from transposed blocks using threads
+            worker_count = min(args.threads, max(1, len(sample_order)))
+            output_executor = (
+                ThreadPoolExecutor(max_workers=worker_count)
+                if worker_count > 1 else None
+            )
+            try:
+                for group_start in range(0, len(sample_order), worker_count):
+                    group = sample_order[group_start:group_start + worker_count]
+                    if output_executor is None:
+                        assembled = [
+                            assemble_sample(group[0], nt_temp_path, nt_blocks,
+                                            bin_temp_path, bin_blocks)
+                        ]
                     else:
-                        print("Sample, '{}', added to the nucleotide matrix(ces).".format(
-                                  sample_names[idx]))
+                        assembled = list(output_executor.map(
+                            lambda s: assemble_sample(s, nt_temp_path, nt_blocks,
+                                                      bin_temp_path, bin_blocks),
+                            group))
 
-        # ── Binary matrix ──
-        if write_binary and Path(outfile+".bin.tmp").exists():
-            print("Transposing binary matrix with {:d} workers...".format(num_workers))
+                    for sample_index, nt_seq, bin_seq in assembled:
+                        name = sample_names[sample_index]
+                        padding = (len_longest_name + 3 - len(name)) * " "
 
-            chunks_bin = [[] for _ in range(num_workers)]
-            for i, idx in enumerate(sample_order):
-                chunks_bin[i % num_workers].append(idx)
-            chunks_bin = [c for c in chunks_bin if c]
+                        if output_fas is not None:
+                            output_fas.write(">{}\n{}\n".format(name, nt_seq))
+                        if output_phy is not None:
+                            output_phy.write(name + padding + nt_seq + "\n")
+                        if output_nex is not None:
+                            output_nex.write(name + padding + nt_seq + "\n")
+                        if output_nexbin is not None:
+                            output_nexbin.write(name + padding + bin_seq + "\n")
 
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures_map = {}
-                for chunk in chunks_bin:
-                    future = executor.submit(_extract_sample_sequences,
-                                             (outfile+".bin.tmp", chunk))
-                    futures_map[future] = chunk
+                        if sample_index == idx_outgroup:
+                            if need_nt:
+                                print("Outgroup, '{}', added to the matrix(ces).".format(outgroup))
+                            if need_bin:
+                                print("Outgroup, '{}', added to the binary matrix.".format(outgroup))
+                        else:
+                            if need_nt:
+                                print("Sample {:d} of {:d}, '{}', added to the nucleotide matrix(ces).".format(
+                                    sample_index + 1, num_samples, name))
+                            if need_bin:
+                                print("Sample {:d} of {:d}, '{}', added to the binary matrix.".format(
+                                    sample_index + 1, num_samples, name))
+            finally:
+                if output_executor is not None:
+                    output_executor.shutdown(wait=True)
 
-                all_seqs_bin = {}
-                for future in as_completed(futures_map):
-                    result = future.result()
-                    all_seqs_bin.update(result)
+            print()
+            if output_nex is not None:
+                output_nex.write(";\nEND;\n")
+            if output_nexbin is not None:
+                output_nexbin.write(";\nEND;\n")
+        finally:
+            if output_phy is not None:
+                output_phy.close()
+            if output_fas is not None:
+                output_fas.close()
+            if output_nex is not None:
+                output_nex.close()
+            if output_nexbin is not None:
+                output_nexbin.close()
 
-            for idx in sample_order:
-                is_outgroup = (idx == idx_outgroup)
-                seqout = all_seqs_bin.get(idx, "")
-                padding = (len_longest_name + 3 - len(sample_names[idx])) * " "
-                output_nexbin.write(sample_names[idx]+padding+seqout+"\n")
-                if is_outgroup:
-                    print("Outgroup, '{}', added to the binary matrix.".format(outgroup))
-                else:
-                    print("Sample, '{}', added to the binary matrix.".format(
-                              sample_names[idx]))
+        if not args.phylipdisable:
+            print("PHYLIP matrix saved to: " + outfile + ".phy")
+        if args.fasta:
+            print("FASTA matrix saved to: " + outfile + ".fasta")
+        if args.nexus:
+            print("NEXUS matrix saved to: " + outfile + ".nexus")
+        if args.nexusbin:
+            print("BINARY NEXUS matrix saved to: " + outfile + ".bin.nexus")
 
-    print()
-    if not args.phylipdisable:
-        print("PHYLIP matrix saved to: " + outfile+".phy")
-        output_phy.close()
-    if args.fasta:
-        print("FASTA matrix saved to: " + outfile+".fasta")
-        output_fas.close()
-    if args.nexus:
-        output_nex.write(";\nEND;\n")
-        print("NEXUS matrix saved to: " + outfile+".nex")
-        output_nex.close()
-    if write_binary:
-        output_nexbin.write(";\nEND;\n")
-        print("BINARY NEXUS matrix saved to: " + outfile+".bin.nex")
-        output_nexbin.close()
+    finally:
+        # Clean up any handles still open (e.g. if an exception occurred)
+        if nt_temp is not None:
+            nt_temp.close()
+        if bin_temp is not None:
+            bin_temp.close()
+        if used_sites is not None:
+            used_sites.close()
+        if nt_temp_path is not None:
+            Path(nt_temp_path).unlink(missing_ok=True)
+        if bin_temp_path is not None:
+            Path(bin_temp_path).unlink(missing_ok=True)
 
-    if write_nucleotide:
-        Path(outfile+".tmp").unlink()
-    if write_binary:
-        Path(outfile+".bin.tmp").unlink()
-
-    print( "\nDone!\n")
+    print("\nDone!\n")
 
 
 if __name__ == "__main__":
