@@ -101,16 +101,16 @@ Tested on i9-14900KF (32 cores), 1,080,920 SNPs × 412 samples:
 
 > Gzip decompression is sequential — bottleneck caps at ~6.6× with 4 threads.
 
-### Uncompressed VCF (12 GB)
+### Uncompressed VCF (12 GB, averaged over 2 runs)
 
 | Threads | Time (s) | Speedup |
 |---------|----------|---------|
-| original v2.9 | 219.64 | 1.00× |
-| mt5 -t 1 | 136.16 | 1.61× |
-| mt5 -t 2 | 69.95 | 3.13× |
-| mt5 -t 4 | 36.50 | 6.01× |
-| mt5 -t 8 | 21.40 | **10.26×** |
-| mt5 -t 16 | 17.19 | **12.77×** |
+| original v2.9 | 220.19 | 1.00× |
+| mt5 -t 1 | 136.91 | 1.61× |
+| mt5 -t 2 | 70.08 | 3.14× |
+| mt5 -t 4 | 36.42 | 6.05× |
+| mt5 -t 8 | 21.55 | **10.22×** |
+| mt5 -t 16 | 17.27 | **12.75×** |
 
 > Without gzip bottleneck, scales linearly to 12.8× at 16 threads.
 
