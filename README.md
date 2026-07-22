@@ -84,6 +84,38 @@ Estimated data records: 1,234,567; average sampled row: 10,967 bytes
 VCF chunk limit: 64 MiB or 15,000 data records; target about 320 tasks (auto from CPU count and estimated VCF workload)
 ```
 
+## Benchmark
+
+Tested on i9-14900KF (32 cores), 1,080,920 SNPs × 412 samples:
+
+### Gzipped VCF (1.9 GB)
+
+| Threads | Time (s) | Speedup |
+|---------|----------|---------|
+| original v2.9 | 247.00 | 1.00× |
+| mt5 -t 1 | 159.89 | 1.54× |
+| mt5 -t 2 | 71.18 | 3.47× |
+| mt5 -t 4 | 37.67 | **6.55×** |
+| mt5 -t 8 | 37.25 | 6.63× |
+| mt5 -t 16 | 36.64 | 6.74× |
+
+> Gzip decompression is sequential — bottleneck caps at ~6.6× with 4 threads.
+
+### Uncompressed VCF (12 GB)
+
+| Threads | Time (s) | Speedup |
+|---------|----------|---------|
+| original v2.9 | 219.64 | 1.00× |
+| mt5 -t 1 | 136.16 | 1.61× |
+| mt5 -t 2 | 69.95 | 3.13× |
+| mt5 -t 4 | 36.50 | 6.01× |
+| mt5 -t 8 | 21.40 | **10.26×** |
+| mt5 -t 16 | 17.19 | **12.77×** |
+
+> Without gzip bottleneck, scales linearly to 12.8× at 16 threads.
+
+**Tip:** If your pipeline already decompresses VCF for other tools, run vcf2phylip on the uncompressed file for maximum speed.
+
 ## Credits
 
 - Original code: [Edgardo M. Ortiz](https://github.com/edgardomortiz)
