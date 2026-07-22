@@ -2,26 +2,49 @@
 
 Convert SNPs in VCF format to PHYLIP, NEXUS, binary NEXUS, or FASTA alignments for phylogenetic analysis.
 
-**Multithreaded fork** of [edgardomortiz/vcf2phylip](https://github.com/edgardomortiz/vcf2phylip) (v2.9) with parallel processing support.
+**Multithreaded fork** of [edgardomortiz/vcf2phylip](https://github.com/edgardomortiz/vcf2phylip) (v2.9) with parallel processing and adaptive chunking.
 
 ## What's new
 
-Added `-t / --threads` parameter for multiprocessing. All other parameters and output are **identical** to the original.
+Added `-t/--threads` and `--chunk-size-mb` parameters. All other parameters and output are **identical** to the original.
 
 ### Parallelized stages
 
 | Stage | Description |
 |-------|-------------|
-| **Phase 1** | VCF parsing + genotype conversion — 32MB byte-based chunks, streamed with backpressure via `ProcessPoolExecutor` |
+| **Phase 1** | VCF parsing + genotype conversion — adaptive chunks profiled from VCF, streamed with backpressure via `ProcessPoolExecutor` |
 | **Phase 2** | Matrix assembly — transposed blocks written during Phase 1, per-sample `seek()` via `ThreadPoolExecutor` |
+
+### Adaptive chunking
+
+The script profiles the input VCF (samples 32MB prefix) to estimate total size, record count, and average row width. Chunk limits are then calculated from CPU count and workload:
+
+- Targets 8–12 tasks per worker depending on SNP count
+- Compressed VCFs get slightly fewer tasks (gzip decompression is sequential)
+- Dual limit: chunk ends at byte target OR record target, whichever comes first
+- Override with `--chunk-size-mb` if needed
+
+### Smart CPU detection
+
+Automatically detects available CPUs respecting:
+- HPC scheduler limits (SLURM, PBS, LSF)
+- Linux CPU affinity / cgroup / cpuset
+- Python 3.13+ `os.process_cpu_count()`
 
 ## Usage
 
 ```bash
-# Auto-detect cores (default), or specify
-python3 vcf2phylip.py -i myfile.vcf -f          # uses available CPUs (respects SLURM/cgroup)
-python3 vcf2phylip.py -i myfile.vcf -f -t 4     # 4 processes
-python3 vcf2phylip.py -i myfile.vcf -f -t 1     # single-threaded (original behavior)
+# Auto-detect CPUs (default), adaptive chunking
+python3 vcf2phylip.py -i myfile.vcf -f
+
+# Specify worker count
+python3 vcf2phylip.py -i myfile.vcf -f -t 8
+
+# Single-threaded (original behavior)
+python3 vcf2phylip.py -i myfile.vcf -f -t 1
+
+# Override chunk size
+python3 vcf2phylip.py -i myfile.vcf -f --chunk-size-mb 64
 ```
 
 ## Full usage
@@ -30,7 +53,7 @@ python3 vcf2phylip.py -i myfile.vcf -f -t 1     # single-threaded (original beha
 usage: vcf2phylip.py [-h] -i FILENAME [--output-folder FOLDER]
                      [--output-prefix PREFIX] [-m MIN_SAMPLES_LOCUS]
                      [-o OUTGROUP] [-p] [-f] [-n] [-b] [-r] [-w]
-                     [-t THREADS] [-v]
+                     [-t THREADS] [--chunk-size-mb CHUNK_SIZE_MB] [-v]
 
 optional arguments:
   -i FILENAME, --input FILENAME
@@ -44,23 +67,22 @@ optional arguments:
   -b, --nexus-binary
   -r, --resolve-IUPAC
   -w, --write-used-sites
-  -t THREADS, --threads THREADS    Parallel workers (default: auto-detect, respects SLURM/cgroup)
+  -t THREADS, --threads THREADS         Parallel workers (default: 100% of available CPUs)
+  --chunk-size-mb CHUNK_SIZE_MB         Override auto chunk size in MiB
   -v, --version
 ```
 
-## Benchmark
+## Example output
 
-Tested on a 1.9 GB VCF (412 samples × ~100K SNPs, LD-pruned):
+```
+Converting file '412samples.vcf.gz':
 
-| Configuration | Time (s) | Speedup |
-|---------------|----------|---------|
-| original (1 thread) | — | 1× |
-| parallel -t 1 | — | ~1× |
-| parallel -t 4 | — | ~3× |
-| parallel -t 8 | — | ~5× |
-| parallel -t 16 | — | ~8× |
-
-*(Fill in actual numbers after running `benchmark_vcf2phylip.sh`)*
+Number of samples in VCF: 412
+Parallel workers: 32 (100% auto-detected from CPU affinity; not reduced by VCF size)
+VCF size: 1.9 GiB stored; about 12.3 GiB uncompressed (gzip/BGZF prefix estimate)
+Estimated data records: 1,234,567; average sampled row: 10,967 bytes
+VCF chunk limit: 64 MiB or 15,000 data records; target about 320 tasks (auto from CPU count and estimated VCF workload)
+```
 
 ## Credits
 
