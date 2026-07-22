@@ -68,7 +68,7 @@ Tested on a 1.9 GB VCF (412 samples × ~100K SNPs, LD-pruned):
 ## Credits
 
 - Original code: [Edgardo M. Ortiz](https://github.com/edgardomortiz)
-- Multithreaded version: [Ma Wenxin](https://github.com/mawenxin)
+- Multithreaded version: [Ma Wenxin](https://github.com/VensinMa)
 
 ## Citation
 
