@@ -1,92 +1,212 @@
-# vcf2phylip (Multithreaded)
+# vcf2phylip (multithreaded, adaptive compressed-input backends)
 
-Convert SNPs in VCF format to PHYLIP, NEXUS, binary NEXUS, or FASTA alignments for phylogenetic analysis.
+Convert SNP genotypes in VCF format to relaxed PHYLIP, FASTA, NEXUS, or binary NEXUS matrices for phylogenetic analysis.
 
-**Multithreaded fork** of [edgardomortiz/vcf2phylip](https://github.com/edgardomortiz/vcf2phylip) (v2.9) with parallel processing and adaptive chunking.
+This repository is a performance-oriented fork of [`edgardomortiz/vcf2phylip`](https://github.com/edgardomortiz/vcf2phylip) v2.9. Version **2.9-mt6** preserves the original matrix formats and filtering behavior while adding multiprocessing, optimized matrix transposition, automatic CPU detection, adaptive chunking, and compressed-input backend selection.
 
-## What's new
+## What mt6 adds
 
-Added `-t/--threads` and `--chunk-size-mb` parameters. All other parameters and output are **identical** to the original.
+The input path is selected from the actual file bytes rather than from the `.gz` suffix:
 
-### Parallelized stages
+| Input detected | Automatic processing path |
+|---|---|
+| Plain VCF | Binary stream → multiprocessing genotype parsing |
+| Ordinary gzip | `python-isal` → `python-zlib-ng` → stdlib `gzip`, in that priority order |
+| BGZF without TBI/CSI | HTSlib `bgzip -@` multithreaded decompression → multiprocessing parsing |
+| BGZF with TBI/CSI | Ordered chromosome/window queries through `tabix`; decompression and parsing run in parallel |
 
-| Stage | Description |
-|-------|-------------|
-| **Phase 1** | VCF parsing + genotype conversion — adaptive chunks profiled from VCF, streamed with backpressure via `ProcessPoolExecutor` |
-| **Phase 2** | Matrix assembly — transposed blocks written during Phase 1, per-sample `seek()` via `ThreadPoolExecutor` |
+A `.vcf.gz` file is treated as BGZF only when its gzip extra field contains a valid `BC` BGZF subfield and the first block can be decompressed successfully. Merely having a `.gz` suffix or a `.tbi` file is not enough.
 
-### Adaptive chunking
+### Indexed BGZF mode
 
-The script profiles the input VCF (samples 32MB prefix) to estimate total size, record count, and average row width. Chunk limits are then calculated from CPU count and workload:
+Indexed mode is enabled automatically only when all of the following are true:
 
-- Targets 8–12 tasks per worker depending on SNP count
-- Compressed VCFs get slightly fewer tasks (gzip decompression is sequential)
-- Dual limit: chunk ends at byte target OR record target, whichever comes first
-- Override with `--chunk-size-mb` if needed
+1. The file is verified as BGZF.
+2. A sidecar `<file>.tbi` or `<file>.csi` exists.
+3. The `tabix` executable is available.
+4. `tabix -l` can read sequence names from the index.
 
-### Smart CPU detection
+Contigs are processed in index order. When `##contig` lengths are available, large contigs are divided into ordered windows. Returned records are filtered by their VCF `POS`, preventing overlap-based tabix queries from duplicating records that span a window boundary. If indexed mode fails in automatic mode, the program discards partial temporary data and retries with sequential BGZF streaming.
 
-Automatically detects available CPUs respecting:
-- HPC scheduler limits (SLURM, PBS, LSF)
-- Linux CPU affinity / cgroup / cpuset
-- Python 3.13+ `os.process_cpu_count()`
+HTSlib documents BGZF as concatenated gzip-compatible blocks smaller than 64 KiB and supports multithreaded `bgzip` operation with `-@`. Tabix requires position-sorted BGZF input and a TBI or CSI index for region retrieval:
 
-## Usage
+- <https://www.htslib.org/doc/bgzip.html>
+- <https://www.htslib.org/doc/tabix.html>
+
+## Compatibility
+
+The original options and outputs remain available:
+
+- plain VCF and compressed VCF
+- arbitrary-ploidy nucleotide matrices
+- relaxed PHYLIP, FASTA, and NEXUS
+- diploid biallelic binary NEXUS for SNAPP
+- IUPAC heterozygous consensus
+- random `--resolve-IUPAC`
+- `--min-samples-locus`
+- outgroup-first output
+- `--write-used-sites`
+- output folder and prefix selection
+
+When `--resolve-IUPAC` is not used, worker count and input backend do not change matrix content or ordering.
+
+## Requirements
+
+Required:
+
+- Python 3.8 or newer
+
+Optional accelerators:
+
+- HTSlib `bgzip` and `tabix`: recommended for BGZF input
+- [`python-isal`](https://python-isal.readthedocs.io/): faster ordinary-gzip decompression
+- [`python-zlib-ng`](https://python-zlib-ng.readthedocs.io/): ordinary-gzip fallback acceleration
+
+The program remains functional with the Python standard library alone.
+
+Example installations:
 
 ```bash
-# Auto-detect CPUs (default), adaptive chunking
-python3 vcf2phylip.py -i myfile.vcf -f
+# Conda / mamba: full compressed-input acceleration
+mamba install -c conda-forge -c bioconda htslib python-isal python-zlib-ng
 
-# Specify worker count
-python3 vcf2phylip.py -i myfile.vcf -f -t 8
-
-# Single-threaded (original behavior)
-python3 vcf2phylip.py -i myfile.vcf -f -t 1
-
-# Override chunk size
-python3 vcf2phylip.py -i myfile.vcf -f --chunk-size-mb 64
+# Pip: optional ordinary-gzip accelerators only
+python3 -m pip install isal zlib-ng
 ```
 
-## Full usage
+## Basic usage
 
-```
-usage: vcf2phylip.py [-h] -i FILENAME [--output-folder FOLDER]
-                     [--output-prefix PREFIX] [-m MIN_SAMPLES_LOCUS]
-                     [-o OUTGROUP] [-p] [-f] [-n] [-b] [-r] [-w]
-                     [-t THREADS] [--chunk-size-mb CHUNK_SIZE_MB] [-v]
-
-optional arguments:
-  -i FILENAME, --input FILENAME
-  --output-folder FOLDER
-  --output-prefix PREFIX
-  -m MIN_SAMPLES_LOCUS, --min-samples-locus MIN_SAMPLES_LOCUS
-  -o OUTGROUP, --outgroup OUTGROUP
-  -p, --phylip-disable
-  -f, --fasta
-  -n, --nexus
-  -b, --nexus-binary
-  -r, --resolve-IUPAC
-  -w, --write-used-sites
-  -t THREADS, --threads THREADS         Parallel workers (default: 100% of available CPUs)
-  --chunk-size-mb CHUNK_SIZE_MB         Override auto chunk size in MiB
-  -v, --version
+```bash
+python3 vcf2phylip.py -i input.vcf.gz -m 380 -f -w
 ```
 
-## Example output
+Without `-t`, the program uses 100% of the CPUs available to the current process or scheduler allocation. Input size changes chunk sizing but never reduces this CPU ceiling.
 
+```bash
+# Explicit total CPU budget
+python3 vcf2phylip.py -i input.vcf.gz -m 380 -f -t 32
 ```
-Converting file '412samples.vcf.gz':
 
-Number of samples in VCF: 412
-Parallel workers: 32 (100% auto-detected from CPU affinity; not reduced by VCF size)
-VCF size: 1.9 GiB stored; about 12.3 GiB uncompressed (gzip/BGZF prefix estimate)
-Estimated data records: 1,234,567; average sampled row: 10,967 bytes
-VCF chunk limit: 64 MiB or 15,000 data records; target about 320 tasks (auto from CPU count and estimated VCF workload)
+For a BGZF stream without an index, part of the `-t` budget is assigned to `bgzip` and the remainder to parser processes. For indexed BGZF, all workers are independent tabix region workers.
+
+## New performance options
+
+```text
+-t, --threads N
+    Total CPU budget. Default: all CPUs available to the job.
+
+--chunk-size-mb N
+    Override the automatically selected chunk byte limit.
+
+--input-backend {auto,plain,stdlib,isal,zlib-ng,bgzip,tabix}
+    Override backend selection for benchmarking or troubleshooting.
+
+--decompression-threads N
+    Threads reserved for the streaming bgzip backend. The value must be
+    smaller than the total -t budget when -t > 1.
+
+--no-indexed-regions
+    Ignore TBI/CSI region parallelism and use the best streaming backend.
+```
+
+Examples:
+
+```bash
+# Force indexed BGZF processing
+python3 vcf2phylip.py -i input.vcf.gz -t 32 --input-backend tabix -f
+
+# Use BGZF streaming even though an index exists
+python3 vcf2phylip.py -i input.vcf.gz -t 32 --no-indexed-regions -f
+
+# Reserve 6 of 32 CPUs for bgzip decompression
+python3 vcf2phylip.py -i input.vcf.gz -t 32 \
+  --no-indexed-regions --decompression-threads 6 -f
+
+# Force the dependency-free gzip reader
+python3 vcf2phylip.py -i input.vcf.gz --input-backend stdlib -f
+```
+
+## Startup report
+
+The selected path is printed before conversion:
+
+```text
+Parallel workers: 32 (100% auto-detected from SLURM_CPUS_PER_TASK; not reduced by VCF size)
+Detected input format: BGZF
+Input backend: indexed BGZF parallel regions through tabix
+Indexed sidecar: population.vcf.gz.csi
+Region workers: 32
+VCF size: 4.8 GiB stored; about 20.1 GiB uncompressed (gzip/BGZF prefix estimate)
+Estimated data records: 10,120,000; average sampled row: 2,134 bytes
+VCF chunk limit: 53 MiB or 26,000 data records
+```
+
+For streaming BGZF, CPU allocation is reported separately:
+
+```text
+CPU allocation: 6 bgzip threads + 26 parser workers = 32 total
+```
+
+## Preparing indexed BGZF input
+
+```bash
+# Input VCF must be coordinate sorted before indexing
+bcftools sort input.vcf -Oz -o input.sorted.vcf.gz
+
+# TBI is suitable when all coordinates fit its range
+bcftools index -t input.sorted.vcf.gz
+
+# CSI is safer for very long chromosomes
+bcftools index -c input.sorted.vcf.gz
+```
+
+An ordinary gzip file cannot become indexed merely by renaming it or creating an empty `.tbi`; it must first be recompressed as BGZF.
+
+## SLURM example
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=vcf2phylip
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
+#SBATCH --time=24:00:00
+#SBATCH --output=vcf2phylip.%j.out
+#SBATCH --error=vcf2phylip.%j.err
+
+python3 vcf2phylip.py \
+  -i population.filtered.vcf.gz \
+  -m 380 \
+  -f \
+  -w \
+  --output-folder results \
+  --output-prefix population_snps
+```
+
+`SLURM_CPUS_PER_TASK` is detected automatically, so `-t` can be omitted.
+
+## Tests
+
+The included regression tests cover:
+
+- single-worker and multi-worker output equality
+- plain VCF and ordinary gzip
+- verified BGZF with and without an index
+- indexed chromosome/window order
+- overlap records spanning region boundaries
+- automatic fallback from a failing/stale index
+- PHYLIP, FASTA, NEXUS, binary NEXUS, and used-sites output
+- outgroup order, missingness filtering, MNP exclusion, multiallelic SNPs, `<NON_REF>`, and malformed genotypes
+
+Run:
+
+```bash
+python3 tests/test_regression.py
+python3 tests/test_backends.py
 ```
 
 ## Benchmark
 
-Tested on i9-14900KF (32 cores), 1,080,920 SNPs × 412 samples:
+Tested on i9-14900KF (32 cores), 1,080,920 SNPs × 412 samples (v2.9-mt5):
 
 ### Gzipped VCF (1.9 GB)
 
@@ -100,6 +220,7 @@ Tested on i9-14900KF (32 cores), 1,080,920 SNPs × 412 samples:
 | mt5 -t 16 | 36.64 | 6.74× |
 
 > Gzip decompression is sequential — bottleneck caps at ~6.6× with 4 threads.
+> mt6 with tabix index can bypass this limit via region-parallel decompression.
 
 ### Uncompressed VCF (12 GB, averaged over 2 runs)
 
@@ -114,13 +235,12 @@ Tested on i9-14900KF (32 cores), 1,080,920 SNPs × 412 samples:
 
 > Without gzip bottleneck, scales linearly to 12.8× at 16 threads.
 
-**Tip:** If your pipeline already decompresses VCF for other tools, run vcf2phylip on the uncompressed file for maximum speed.
+## Credits and citation
 
-## Credits
+- Original code: Edgardo M. Ortiz
+- Original data/testing: Juan D. Palacio-Mejía
+- Multithreaded fork: Ma Wenxin
 
-- Original code: [Edgardo M. Ortiz](https://github.com/edgardomortiz)
-- Multithreaded version: [Ma Wenxin](https://github.com/VensinMa)
+Please cite the original software:
 
-## Citation
-
-Original: Ortiz, E.M. 2019. vcf2phylip v2.0. DOI:10.5281/zenodo.2540861
+> Ortiz, E.M. 2019. vcf2phylip v2.0: convert a VCF matrix into several matrix formats for phylogenetic analysis. DOI: 10.5281/zenodo.2540861
