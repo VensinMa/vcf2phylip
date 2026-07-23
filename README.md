@@ -206,7 +206,13 @@ python3 tests/test_backends.py
 
 ## Benchmark
 
-Tested on i9-14900KF (P-cores 0-15), 1,080,920 SNPs × 412 samples (v2.9-mt6):
+Tested on i9-14900KF (P-cores 0-15), 1,080,920 SNPs × 412 samples (v2.9-mt6). System resources idle during test.
+
+> **Tip:** For compressed VCF, build a `.tbi` or `.csi` index beforehand to unlock tabix region-parallel mode (up to 28× speedup):
+> ```bash
+> bcftools sort input.vcf -Oz -o input.sorted.vcf.gz
+> bcftools index -t input.sorted.vcf.gz
+> ```
 
 ### 1. Compressed VCF + .tbi index (tabix region-parallel)
 
