@@ -241,9 +241,9 @@ python3 tests/test_backends.py
 
 ## Benchmark
 
-Tested on i9-14900KF, 1,080,920 SNPs × 412 samples (v2.9-mt6). System resources idle during test.
+Tested on i9-14900KF, 1,080,920 SNPs × 412 samples (v2.9-mt7). System resources idle during test.
 
-> **Tip:** For compressed VCF, build a `.tbi` or `.csi` index beforehand to unlock tabix region-parallel mode (up to 28× speedup):
+> **Tip:** For compressed VCF, build a `.tbi` or `.csi` index beforehand to unlock tabix region-parallel mode (up to 30× speedup):
 > ```bash
 > bcftools sort input.vcf -Oz -o input.sorted.vcf.gz
 > bcftools index -t input.sorted.vcf.gz
@@ -254,35 +254,27 @@ Tested on i9-14900KF, 1,080,920 SNPs × 412 samples (v2.9-mt6). System resources
 | Threads | Time (s) | Speedup |
 |---------|----------|---------|
 | original v2.9 | 241.11 | 1.00× |
-| mt6 -t 1 | 78.61 | 3.06× |
-| mt6 -t 2 | 40.68 | 5.92× |
-| mt6 -t 4 | 21.41 | 11.26× |
-| mt6 -t 8 | 12.60 | **19.13×** |
-| mt6 -t 16 | 8.48 | **28.43×** |
+| mt7 -t 8 | 12.91 | **18.68×** |
+| mt7 -t 16 | 8.54 | **28.23×** |
+| mt7 -t auto | 7.11 | **33.91×** |
 
 ### 2. Compressed VCF + no index (BGZF streaming)
 
 | Threads | Time (s) | Speedup |
 |---------|----------|---------|
 | original v2.9 | 241.11 | 1.00× |
-| mt6 -t 1 | 94.96 | 2.54× |
-| mt6 -t 2 | 71.36 | 3.38× |
-| mt6 -t 4 | 37.87 | 6.37× |
-| mt6 -t 8 | 15.41 | **15.64×** |
-| mt6 -t 16 | 15.08 | **15.99×** |
+| mt7 -t 8 | 14.80 | **16.29×** |
+| mt7 -t 16 | 14.81 | **16.28×** |
+| mt7 -t auto | 14.88 | **16.20×** |
 
 ### 3. Uncompressed VCF (12 GB)
 
 | Threads | Time (s) | Speedup |
 |---------|----------|---------|
 | original v2.9 | 218.51 | 1.00× |
-| mt6 -t 1 | 73.25 | 2.98× |
-| mt6 -t 2 | 37.57 | 5.81× |
-| mt6 -t 4 | 19.58 | 11.15× |
-| mt6 -t 8 | 15.71 | **13.90×** |
-| mt6 -t 16 | 15.70 | **13.91×** |
-
-> mt7 adds direct byte-range parallel reading for uncompressed VCF, which should improve scaling beyond 8 threads.
+| mt7 -t 8 | 9.69 | **22.55×** |
+| mt7 -t 16 | 6.65 | **32.86×** |
+| mt7 -t auto | 5.52 | **39.59×** |
 
 ## Credits and citation
 
