@@ -1,21 +1,40 @@
-# vcf2phylip (multithreaded, adaptive compressed-input backends)
+# vcf2phylip (multithreaded, adaptive input backends)
 
 Convert SNP genotypes in VCF format to relaxed PHYLIP, FASTA, NEXUS, or binary NEXUS matrices for phylogenetic analysis.
 
-This repository is a performance-oriented fork of [`edgardomortiz/vcf2phylip`](https://github.com/edgardomortiz/vcf2phylip) v2.9. Version **2.9-mt6** preserves the original matrix formats and filtering behavior while adding multiprocessing, optimized matrix transposition, automatic CPU detection, adaptive chunking, and compressed-input backend selection.
+This repository is a performance-oriented fork of [`edgardomortiz/vcf2phylip`](https://github.com/edgardomortiz/vcf2phylip) v2.9. Version **2.9-mt7** preserves the original matrix formats and filtering behavior while adding multiprocessing, optimized matrix transposition, automatic CPU detection, adaptive chunking, direct plain-VCF range readers, and compressed-input backend selection.
 
-## What mt6 adds
+## Automatic input paths
 
 The input path is selected from the actual file bytes rather than from the `.gz` suffix:
 
 | Input detected | Automatic processing path |
 |---|---|
-| Plain VCF | Binary stream → multiprocessing genotype parsing |
+| Plain VCF, one worker | Sequential binary reader |
+| Plain VCF, multiple workers | Independent aligned byte ranges → direct `pread`/seek → parallel parsing |
 | Ordinary gzip | `python-isal` → `python-zlib-ng` → stdlib `gzip`, in that priority order |
 | BGZF without TBI/CSI | HTSlib `bgzip -@` multithreaded decompression → multiprocessing parsing |
 | BGZF with TBI/CSI | Ordered chromosome/window queries through `tabix`; decompression and parsing run in parallel |
 
 A `.vcf.gz` file is treated as BGZF only when its gzip extra field contains a valid `BC` BGZF subfield and the first block can be decompressed successfully. Merely having a `.gz` suffix or a `.tbi` file is not enough.
+
+### Direct plain-VCF mode
+
+With more than one worker, an uncompressed VCF is divided into ordered raw
+byte ranges. Each worker opens the file independently, aligns its nominal
+start and end offsets to complete newline-delimited VCF records, reads the
+aligned range directly, parses it, and writes a local transposed matrix shard.
+The parent process merges shards in byte-range order.
+
+This removes the mt6 plain-input bottleneck where one parent process read the
+whole VCF and serialized large text chunks through multiprocessing queues.
+Range size is derived from the same CPU/workload-aware chunk profile and is
+bounded to avoid a few oversized tasks. The implementation also handles a
+single VCF record spanning one or more nominal range boundaries without
+duplication or omission.
+
+Use `--input-backend plain-stream` to retain the mt6-style sequential input
+reader for benchmarking or troubleshooting.
 
 ### Indexed BGZF mode
 
@@ -98,8 +117,11 @@ For a BGZF stream without an index, part of the `-t` budget is assigned to `bgzi
 --chunk-size-mb N
     Override the automatically selected chunk byte limit.
 
---input-backend {auto,plain,stdlib,isal,zlib-ng,bgzip,tabix}
+--input-backend {auto,plain,plain-stream,stdlib,isal,zlib-ng,bgzip,tabix}
     Override backend selection for benchmarking or troubleshooting.
+
+    plain        Direct byte-range mode when -t > 1; sequential when -t 1.
+    plain-stream Force one sequential plain-VCF reader feeding parser workers.
 
 --decompression-threads N
     Threads reserved for the streaming bgzip backend. The value must be
@@ -124,6 +146,10 @@ python3 vcf2phylip.py -i input.vcf.gz -t 32 \
 
 # Force the dependency-free gzip reader
 python3 vcf2phylip.py -i input.vcf.gz --input-backend stdlib -f
+
+# Compare the optimized plain-VCF reader with the old streaming path
+python3 vcf2phylip.py -i input.vcf -t 16 --input-backend plain -f
+python3 vcf2phylip.py -i input.vcf -t 16 --input-backend plain-stream -f
 ```
 
 ## Startup report
@@ -145,6 +171,14 @@ For streaming BGZF, CPU allocation is reported separately:
 
 ```text
 CPU allocation: 6 bgzip threads + 26 parser workers = 32 total
+```
+
+For an uncompressed VCF with multiple workers:
+
+```text
+Input backend: plain VCF direct parallel byte ranges
+Direct range workers: 16
+Direct byte ranges: 128
 ```
 
 ## Preparing indexed BGZF input
@@ -189,7 +223,8 @@ python3 vcf2phylip.py \
 The included regression tests cover:
 
 - single-worker and multi-worker output equality
-- plain VCF and ordinary gzip
+- plain VCF direct ranges, forced sequential plain input, and ordinary gzip
+- plain-range boundaries falling inside a multi-megabyte VCF record
 - verified BGZF with and without an index
 - indexed chromosome/window order
 - overlap records spanning region boundaries
@@ -206,7 +241,7 @@ python3 tests/test_backends.py
 
 ## Benchmark
 
-Tested on i9-14900KF (P-cores 0-15), 1,080,920 SNPs × 412 samples (v2.9-mt6). System resources idle during test.
+Tested on i9-14900KF, 1,080,920 SNPs × 412 samples (v2.9-mt6). System resources idle during test.
 
 > **Tip:** For compressed VCF, build a `.tbi` or `.csi` index beforehand to unlock tabix region-parallel mode (up to 28× speedup):
 > ```bash
@@ -246,6 +281,8 @@ Tested on i9-14900KF (P-cores 0-15), 1,080,920 SNPs × 412 samples (v2.9-mt6). S
 | mt6 -t 4 | 19.58 | 11.15× |
 | mt6 -t 8 | 15.71 | **13.90×** |
 | mt6 -t 16 | 15.70 | **13.91×** |
+
+> mt7 adds direct byte-range parallel reading for uncompressed VCF, which should improve scaling beyond 8 threads.
 
 ## Credits and citation
 

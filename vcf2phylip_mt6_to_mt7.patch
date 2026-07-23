@@ -1,0 +1,376 @@
+--- vcf2phylip_mt6.py	2026-07-23 13:30:05.774834022 +0000
++++ vcf2phylip.py	2026-07-23 13:41:51.906826072 +0000
+@@ -7,8 +7,9 @@
+ 
+ This multithreaded/multiprocess edition preserves the command-line behavior
+ of vcf2phylip v2.9. It auto-detects plain VCF, ordinary gzip, and real BGZF
+-from file bytes; selects optional ISA-L, zlib-ng, bgzip, or tabix backends;
+-and parses genotype chunks with multiple worker processes. Indexed BGZF VCFs
++from file bytes; selects direct byte-range, ISA-L, zlib-ng, bgzip, or tabix
++backends; and parses genotypes with multiple worker processes. Plain VCFs can
++be read directly by independent ordered byte ranges, while indexed BGZF VCFs
+ can be decompressed and parsed concurrently by ordered genomic regions. Final
+ sample sequences are assembled concurrently from transposed temporary blocks.
+ 
+@@ -18,9 +19,9 @@
+ __author__ = "Edgardo M. Ortiz"
+ __credits__ = "Juan D. Palacio-Mejia"
+ __modifier__ = "Ma Wenxin"
+-__version__ = "2.9-mt6"
++__version__ = "2.9-mt7"
+ __email__ = "e.ortiz.v@gmail.com"
+-__date__ = "2026-07-22"
++__date__ = "2026-07-23"
+ 
+ import argparse
+ import gzip
+@@ -49,6 +50,7 @@
+ MAX_CHUNK_RECORDS = 100000
+ PROFILE_SAMPLE_BYTES = 32 * MIB
+ PROFILE_SAMPLE_RECORDS = 20000
++MIN_PLAIN_RANGE_BYTES = 4 * MIB
+ 
+ # Dictionary of IUPAC ambiguities for nucleotides.
+ # '*' is a deletion in GATK; deletions are ignored in consensus. Lowercase
+@@ -174,6 +176,89 @@
+     return sample_names, contig_lengths, header_lines
+ 
+ 
++def find_plain_data_start(vcf_file):
++    """Return the byte offset immediately after the plain-VCF header."""
++    with open(vcf_file, "rb") as handle:
++        while True:
++            line = handle.readline()
++            if not line:
++                return handle.tell()
++            if line.startswith(b"#CHROM"):
++                return handle.tell()
++            if not line.startswith(b"#"):
++                raise ValueError(
++                    "VCF data started before a #CHROM header line was found")
++
++
++def build_plain_ranges(vcf_file, data_start, target_tasks, max_range_bytes):
++    """Build ordered raw byte ranges for independent plain-VCF readers."""
++    file_size = Path(vcf_file).stat().st_size
++    data_bytes = max(0, file_size - data_start)
++    if data_bytes == 0:
++        return []
++
++    tasks_for_size = max(1, int(math.ceil(
++        data_bytes / float(max(1, max_range_bytes)))))
++    max_useful_tasks = max(1, int(math.ceil(
++        data_bytes / float(MIN_PLAIN_RANGE_BYTES))))
++    desired_tasks = max(int(target_tasks), tasks_for_size)
++    task_count = max(1, min(desired_tasks, max_useful_tasks, 4096))
++    ranges = []
++    for order in range(task_count):
++        start = data_start + (data_bytes * order) // task_count
++        end = data_start + (data_bytes * (order + 1)) // task_count
++        ranges.append({
++            "order": order,
++            "start": start,
++            "end": end,
++            "data_start": data_start,
++            "is_last": order == task_count - 1,
++        })
++    return ranges
++
++
++def align_plain_offset(handle, offset, data_start, file_size):
++    """Move a nominal byte offset to the next complete VCF line boundary."""
++    if offset <= data_start:
++        return data_start
++    if offset >= file_size:
++        return file_size
++    handle.seek(offset - 1)
++    if handle.read(1) == b"\n":
++        return offset
++    handle.seek(offset)
++    handle.readline()
++    return handle.tell()
++
++
++def read_plain_slice(vcf_file, start, end):
++    """Read an aligned regular-file slice, using pread when available."""
++    length = max(0, end - start)
++    if length == 0:
++        return b""
++    with open(vcf_file, "rb", buffering=0) as handle:
++        if hasattr(os, "pread"):
++            parts = []
++            remaining = length
++            offset = start
++            while remaining:
++                block = os.pread(handle.fileno(), remaining, offset)
++                if not block:
++                    break
++                parts.append(block)
++                offset += len(block)
++                remaining -= len(block)
++            data = b"".join(parts)
++        else:
++            handle.seek(start)
++            data = handle.read(length)
++    if len(data) != length:
++        raise OSError(
++            "Plain VCF ended unexpectedly while reading byte range {}-{}"
++            .format(start, end))
++    return data
++
++
+ def extract_sample_names(vcf_file):
+     """Compatibility wrapper returning sample names from the VCF header."""
+     return read_vcf_header(vcf_file)[0]
+@@ -465,6 +550,11 @@
+     if requested_backend == "plain":
+         if input_format != "plain":
+             raise ValueError("--input-backend plain requires an uncompressed VCF")
++        backend = "plain-range" if total_workers > 1 else "plain"
++    elif requested_backend == "plain-stream":
++        if input_format != "plain":
++            raise ValueError(
++                "--input-backend plain-stream requires an uncompressed VCF")
+         backend = "plain"
+     elif requested_backend == "tabix":
+         if input_format != "bgzf":
+@@ -497,7 +587,7 @@
+     elif requested_backend != "auto":
+         raise ValueError("Unsupported input backend: {}".format(requested_backend))
+     elif input_format == "plain":
+-        backend = "plain"
++        backend = "plain-range" if total_workers > 1 else "plain"
+     elif input_format == "gzip":
+         if isal_available:
+             backend = "isal"
+@@ -530,7 +620,8 @@
+             "--decompression-threads is only used by the bgzip streaming backend")
+ 
+     descriptions = {
+-        "plain": "plain VCF binary stream",
++        "plain": "plain VCF sequential binary stream",
++        "plain-range": "plain VCF direct parallel byte ranges",
+         "stdlib-gzip": "Python stdlib gzip sequential decompression",
+         "isal": "python-isal IGzip sequential decompression",
+         "zlib-ng": "python-zlib-ng gzip sequential decompression",
+@@ -759,6 +850,82 @@
+     }
+ 
+ 
++def process_plain_range(task):
++    """Read, parse, and transpose one ordered byte range of a plain VCF."""
++    order = task["order"]
++    prefix = os.path.join(task["temp_dir"], "range_{:06d}".format(order))
++    nt_path = prefix + ".nt" if task["need_nt"] else None
++    bin_path = prefix + ".bin" if task["need_bin"] else None
++    used_path = prefix + ".used" if task["write_used"] else None
++    malformed_path = prefix + ".malformed"
++    nt_widths = []
++    bin_widths = []
++    counters = (0, 0, 0, 0, 0)
++
++    nt_handle = open(nt_path, "wb") if nt_path else None
++    bin_handle = open(bin_path, "wb") if bin_path else None
++    used_handle = open(used_path, "wb") if used_path else None
++    malformed_handle = open(malformed_path, "wb")
++
++    try:
++        file_size = Path(task["vcf_file"]).stat().st_size
++        with open(task["vcf_file"], "rb", buffering=8 * MIB) as handle:
++            aligned_start = align_plain_offset(
++                handle, task["start"], task["data_start"], file_size)
++            aligned_end = align_plain_offset(
++                handle, task["end"], task["data_start"], file_size)
++            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
++                try:
++                    os.posix_fadvise(
++                        handle.fileno(), aligned_start,
++                        max(0, aligned_end - aligned_start),
++                        os.POSIX_FADV_SEQUENTIAL)
++                except OSError:
++                    pass
++
++        chunk = read_plain_slice(task["vcf_file"], aligned_start, aligned_end)
++        seed = task["random_seed"] if task["resolve_iupac"] else None
++        result = process_vcf_chunk(
++            chunk, task["num_samples"], task["min_samples_locus"],
++            task["need_nt"], task["need_bin"], task["resolve_iupac"],
++            task["write_used"], seed)
++        nt_data, bin_data, used_data, malformed_lines, counters = result
++        if nt_data:
++            block = write_transposed_block(
++                nt_handle, nt_data, task["num_samples"])
++            nt_widths.append(block[1])
++        if bin_data:
++            block = write_transposed_block(
++                bin_handle, bin_data, task["num_samples"])
++            bin_widths.append(block[1])
++        if used_data:
++            used_handle.write(used_data)
++        for malformed in malformed_lines:
++            malformed_handle.write(malformed + b"\n")
++    except BaseException:
++        for path in (nt_path, bin_path, used_path, malformed_path):
++            if path:
++                Path(path).unlink(missing_ok=True)
++        raise
++    finally:
++        for handle in (nt_handle, bin_handle, used_handle, malformed_handle):
++            if handle is not None and not handle.closed:
++                handle.close()
++
++    return {
++        "order": order,
++        "start": task["start"],
++        "end": task["end"],
++        "nt_path": nt_path,
++        "nt_widths": nt_widths,
++        "bin_path": bin_path,
++        "bin_widths": bin_widths,
++        "used_path": used_path,
++        "malformed_path": malformed_path,
++        "counters": counters,
++    }
++
++
+ def merge_region_blocks(global_handle, local_path, widths, global_blocks,
+                         num_samples):
+     """Append worker-generated transposed blocks and register global offsets."""
+@@ -1023,6 +1190,77 @@
+     return counters
+ 
+ 
++def run_plain_range_conversion(vcf_file, plan, chunk_bytes, chunk_records,
++                               target_tasks, task_args, nt_temp, nt_blocks,
++                               bin_temp, bin_blocks, used_sites,
++                               scratch_parent):
++    """Run direct file-range parallelism for an uncompressed VCF."""
++    data_start = find_plain_data_start(vcf_file)
++    ranges = build_plain_ranges(
++        vcf_file, data_start, target_tasks, chunk_bytes)
++    print("Direct byte ranges: {:,d}".format(len(ranges)))
++    if not ranges:
++        return (0, 0, 0, 0, 0)
++
++    range_temp_dir = tempfile.mkdtemp(
++        prefix=".vcf2phylip_ranges_", dir=str(scratch_parent))
++    counters = (0, 0, 0, 0, 0)
++    next_progress = 500000
++
++    tasks = []
++    for range_spec in ranges:
++        task = dict(range_spec)
++        task.update({
++            "vcf_file": str(vcf_file),
++            "temp_dir": range_temp_dir,
++            "chunk_bytes": chunk_bytes,
++            "chunk_records": chunk_records,
++            "num_samples": task_args[0],
++            "min_samples_locus": task_args[1],
++            "need_nt": task_args[2],
++            "need_bin": task_args[3],
++            "resolve_iupac": task_args[4],
++            "write_used": task_args[5],
++            "random_seed": random.getrandbits(64),
++        })
++        tasks.append(task)
++
++    try:
++        if plan["parser_workers"] == 1:
++            results = map(process_plain_range, tasks)
++            executor = None
++        else:
++            executor = ProcessPoolExecutor(max_workers=plan["parser_workers"])
++            results = executor.map(process_plain_range, tasks, chunksize=1)
++
++        try:
++            for result in results:
++                print_malformed_file(result["malformed_path"])
++                merge_region_blocks(
++                    nt_temp, result["nt_path"], result["nt_widths"],
++                    nt_blocks, task_args[0])
++                merge_region_blocks(
++                    bin_temp, result["bin_path"], result["bin_widths"],
++                    bin_blocks, task_args[0])
++                if result["used_path"]:
++                    used_path = Path(result["used_path"])
++                    if used_path.exists() and used_sites is not None:
++                        with used_path.open("rb") as source:
++                            shutil.copyfileobj(source, used_sites, length=8 * MIB)
++                    used_path.unlink(missing_ok=True)
++
++                counters = _accumulate_counters(counters, result["counters"])
++                while counters[0] >= next_progress:
++                    print("{:d} genotypes processed.".format(next_progress))
++                    next_progress += 500000
++        finally:
++            if executor is not None:
++                executor.shutdown(wait=True)
++    finally:
++        shutil.rmtree(range_temp_dir, ignore_errors=True)
++    return counters
++
++
+ def run_indexed_conversion(vcf_file, plan, contig_lengths, chunk_bytes,
+                            chunk_records, task_args, nt_temp, nt_blocks,
+                            bin_temp, bin_blocks, used_sites, scratch_parent):
+@@ -1223,7 +1461,8 @@
+                         help="Override auto byte limit in MiB; record limit remains adaptive")
+     parser.add_argument(
+         "--input-backend", default="auto",
+-        choices=("auto", "plain", "stdlib", "isal", "zlib-ng", "bgzip", "tabix"),
++        choices=("auto", "plain", "plain-stream", "stdlib", "isal",
++                 "zlib-ng", "bgzip", "tabix"),
+         help="Override automatic input backend selection (default: auto)")
+     parser.add_argument(
+         "--decompression-threads", type=positive_int, default=None,
+@@ -1279,6 +1518,8 @@
+     elif plan["backend"] == "tabix":
+         print("Indexed sidecar: {}".format(plan["index_path"]))
+         print("Region workers: {:d}".format(plan["parser_workers"]))
++    elif plan["backend"] == "plain-range":
++        print("Direct range workers: {:d}".format(plan["parser_workers"]))
+     else:
+         print("Parser workers: {:d}".format(plan["parser_workers"]))
+ 
+@@ -1332,7 +1573,39 @@
+             num_samples, args.min_samples_locus, need_nt, need_bin,
+             args.resolve_iupac, args.write_used,
+         )
+-        if plan["backend"] == "tabix":
++        if plan["backend"] == "plain-range":
++            try:
++                counters = run_plain_range_conversion(
++                    args.filename, plan, chunk_bytes, chunk_records,
++                    target_tasks, task_args, nt_temp, nt_blocks, bin_temp,
++                    bin_blocks, used_sites, output_folder)
++            except (OSError, RuntimeError, ValueError) as error:
++                if args.input_backend not in ("auto", "plain"):
++                    raise
++                print("WARNING: direct plain-VCF range mode failed: {}".format(error))
++                print("Falling back to the sequential plain-VCF reader without changing output semantics.")
++                if nt_temp is not None:
++                    nt_temp.seek(0)
++                    nt_temp.truncate()
++                if bin_temp is not None:
++                    bin_temp.seek(0)
++                    bin_temp.truncate()
++                nt_blocks.clear()
++                bin_blocks.clear()
++                if used_sites is not None:
++                    used_sites.seek(0)
++                    used_sites.truncate()
++                    used_sites.write(b"#CHROM\tPOS\tNUM_SAMPLES\n")
++
++                fallback_plan = select_input_plan(
++                    args.filename, args.threads, "plain-stream")
++                print("Fallback backend: {}".format(
++                    fallback_plan["description"]))
++                counters = run_stream_conversion(
++                    args.filename, fallback_plan, chunk_bytes, chunk_records,
++                    task_args, nt_temp, nt_blocks, bin_temp, bin_blocks,
++                    used_sites)
++        elif plan["backend"] == "tabix":
+             try:
+                 counters = run_indexed_conversion(
+                     args.filename, plan, contig_lengths, chunk_bytes, chunk_records,

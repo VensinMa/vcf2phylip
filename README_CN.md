@@ -1,6 +1,6 @@
-# vcf2phylip 2.9-mt6 并行优化版
+# vcf2phylip 2.9-mt7 并行优化版
 
-该版本基于 `edgardomortiz/vcf2phylip` v2.9，在保留原有参数、过滤逻辑和输出格式的基础上，加入多进程解析、矩阵块式转置、CPU 自动检测、智能分块，以及针对不同压缩格式的自动加速后端。
+该版本基于 `edgardomortiz/vcf2phylip` v2.9，在保留原有参数、过滤逻辑和输出格式的基础上，加入多进程解析、矩阵块式转置、CPU 自动检测、智能分块、普通 VCF 直接字节区间并行读取，以及针对不同压缩格式的自动加速后端。
 
 ## 自动输入路径
 
@@ -8,12 +8,35 @@
 
 | 实际输入格式 | 自动处理方式 |
 |---|---|
-| 普通 `.vcf` | 二进制流读取 + 多进程基因型解析 |
+| 普通 `.vcf`，单 worker | 顺序二进制读取 |
+| 普通 `.vcf`，多 worker | 独立字节区间 + `pread`/seek 直接读取 + 并行解析 |
 | 普通 gzip | 优先 `python-isal`，其次 `python-zlib-ng`，最后回退 Python `gzip` |
 | BGZF、无 TBI/CSI | `bgzip -@` 多线程解压 + 多进程解析 |
 | BGZF、有 TBI/CSI | `tabix` 按染色体/窗口并行读取、解压和解析 |
 
 只有在 gzip extra field 中找到有效的 BGZF `BC` 子字段，并且首个 BGZF block 可以正确解压时，程序才会判定为 BGZF。文件名是 `.vcf.gz` 或旁边存在 `.tbi` 并不足以证明它是 BGZF。
+
+## 普通 VCF 直接区间并行
+
+当普通未压缩 VCF 使用两个或更多 worker 时，程序不再由主进程顺序读取整个文件并把大块文本发送给子进程，而是：
+
+1. 根据文件大小、CPU 数和估算记录数生成有序字节区间；
+2. 每个 worker 独立打开同一个 VCF；
+3. 把理论起止位置对齐到完整换行记录；
+4. 使用 `os.pread()`，不支持时回退 `seek/read`，直接读取自己的区间；
+5. 在 worker 内完成解析和矩阵块转置；
+6. 主进程按照原始字节区间顺序合并结果。
+
+这样可以消除 mt6 普通 VCF 路径中的主进程顺序读取和大块 VCF 文本 IPC 传输。即使一条超长 VCF 记录跨越一个或多个理论边界，也不会重复或遗漏。
+
+如需测试旧式顺序读取路径，可使用：
+
+```bash
+python3 vcf2phylip.py \
+  -i input.vcf \
+  -t 16 \
+  --input-backend plain-stream
+```
 
 ## BGZF 索引并行模式
 
@@ -77,8 +100,14 @@ BGZF 有索引时，32 个 worker 分别执行独立的 tabix 区域读取、解
 ## 新增参数
 
 ```text
---input-backend {auto,plain,stdlib,isal,zlib-ng,bgzip,tabix}
+--input-backend {auto,plain,plain-stream,stdlib,isal,zlib-ng,bgzip,tabix}
     手动覆盖自动后端，主要用于测试或排错。
+
+    plain
+        多 worker 时使用普通 VCF 直接字节区间；-t 1 时顺序读取。
+
+    plain-stream
+        强制使用单个顺序读取器，再把数据块发送给解析进程。
 
 --decompression-threads N
     为 BGZF 流式 bgzip 解压保留 N 个线程。
@@ -120,6 +149,12 @@ python3 vcf2phylip.py \
   -f
 ```
 
+```bash
+# 普通 VCF 新旧读取路径对比
+python3 vcf2phylip.py -i population.vcf -t 16 --input-backend plain
+python3 vcf2phylip.py -i population.vcf -t 16 --input-backend plain-stream
+```
+
 ## 准备 BGZF 和索引
 
 ```bash
@@ -157,4 +192,4 @@ python3 tests/test_regression.py
 python3 tests/test_backends.py
 ```
 
-测试覆盖普通 VCF、普通 gzip、BGZF 无索引、BGZF+TBI/CSI、跨窗口重叠记录、防重复、索引失败自动回退，以及全部矩阵格式和原有过滤功能。
+测试覆盖普通 VCF 直接区间、强制顺序读取、边界落在数 MiB 超长记录内部、普通 gzip、BGZF 无索引、BGZF+TBI/CSI、跨窗口重叠记录、防重复、索引失败自动回退，以及全部矩阵格式和原有过滤功能。
