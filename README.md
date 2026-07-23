@@ -206,34 +206,40 @@ python3 tests/test_backends.py
 
 ## Benchmark
 
-Tested on i9-14900KF (32 cores), 1,080,920 SNPs × 412 samples (v2.9-mt5):
+Tested on i9-14900KF (P-cores 0-15), 1,080,920 SNPs × 412 samples, 5 runs each (v2.9-mt6):
 
-### Gzipped VCF (1.9 GB)
+### 1. Compressed VCF + .tbi index (tabix region-parallel)
 
-| Threads | Time (s) | Speedup |
-|---------|----------|---------|
-| original v2.9 | 247.00 | 1.00× |
-| mt5 -t 1 | 159.89 | 1.54× |
-| mt5 -t 2 | 71.18 | 3.47× |
-| mt5 -t 4 | 37.67 | **6.55×** |
-| mt5 -t 8 | 37.25 | 6.63× |
-| mt5 -t 16 | 36.64 | 6.74× |
+| Threads | Mean (s) | Median | Min | Max | Speedup |
+|---------|----------|--------|-----|-----|---------|
+| original v2.9 | 241.11 | — | — | — | 1.00× |
+| mt6 -t 1 | 79.25 | 79.18 | 78.57 | 80.20 | 3.04× |
+| mt6 -t 2 | 40.91 | 40.76 | 40.24 | 41.64 | 5.89× |
+| mt6 -t 4 | 21.53 | 21.59 | 21.27 | 21.74 | 11.20× |
+| mt6 -t 8 | 13.96 | 13.94 | 13.78 | 14.16 | **17.27×** |
+| mt6 -t 16 | 11.65 | 11.67 | 11.45 | 11.78 | **20.69×** |
 
-> Gzip decompression is sequential — bottleneck caps at ~6.6× with 4 threads.
-> mt6 with tabix index can bypass this limit via region-parallel decompression.
+### 2. Compressed VCF + no index (BGZF streaming)
 
-### Uncompressed VCF (12 GB, averaged over 2 runs)
+| Threads | Mean (s) | Median | Min | Max | Speedup |
+|---------|----------|--------|-----|-----|---------|
+| original v2.9 | 241.11 | — | — | — | 1.00× |
+| mt6 -t 1 | 94.96 | 95.24 | 93.67 | 95.74 | 2.54× |
+| mt6 -t 2 | 71.36 | 71.45 | 70.63 | 72.34 | 3.38× |
+| mt6 -t 4 | 37.87 | 37.74 | 37.58 | 38.31 | 6.37× |
+| mt6 -t 8 | 15.41 | 15.33 | 15.21 | 15.59 | **15.64×** |
+| mt6 -t 16 | 15.08 | 15.03 | 14.99 | 15.20 | **15.99×** |
 
-| Threads | Time (s) | Speedup |
-|---------|----------|---------|
-| original v2.9 | 220.19 | 1.00× |
-| mt5 -t 1 | 136.91 | 1.61× |
-| mt5 -t 2 | 70.08 | 3.14× |
-| mt5 -t 4 | 36.42 | 6.05× |
-| mt5 -t 8 | 21.55 | **10.22×** |
-| mt5 -t 16 | 17.27 | **12.75×** |
+### 3. Uncompressed VCF (12 GB)
 
-> Without gzip bottleneck, scales linearly to 12.8× at 16 threads.
+| Threads | Mean (s) | Median | Min | Max | Speedup |
+|---------|----------|--------|-----|-----|---------|
+| original v2.9 | 218.51 | — | — | — | 1.00× |
+| mt6 -t 1 | 72.56 | 72.88 | 71.22 | 73.98 | 3.01× |
+| mt6 -t 2 | 37.51 | 37.56 | 37.14 | 37.91 | 5.83× |
+| mt6 -t 4 | 19.90 | 19.95 | 19.65 | 20.04 | 10.98× |
+| mt6 -t 8 | 16.45 | 16.37 | 16.33 | 16.76 | **13.28×** |
+| mt6 -t 16 | 16.43 | 16.39 | 16.26 | 16.69 | **13.30×** |
 
 ## Credits and citation
 
