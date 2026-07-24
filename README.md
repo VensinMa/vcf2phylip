@@ -14,6 +14,39 @@ i9-14900KF, 1,080,920 SNPs × 412 samples, 5 runs each.
 | Compressed VCF + no index (bgzip) | 241.11s | 14.80s (16.3×) | 14.81s (16.3×) | 14.88s (16.2×) |
 | Uncompressed VCF (12 GB) | 218.51s | 9.69s (22.6×) | 6.65s (32.9×) | **5.52s (39.6×)** |
 
+> **Tip:** For compressed VCF, build a `.tbi` or `.csi` index beforehand to unlock tabix region-parallel mode (up to 30× speedup):
+> ```bash
+> bcftools sort input.vcf -Oz -o input.sorted.vcf.gz
+> bcftools index -t input.sorted.vcf.gz
+> ```
+
+### 1. Compressed VCF + .tbi index (tabix region-parallel)
+
+| Threads | Time (s) | Speedup |
+|---------|----------|---------|
+| original v2.9 | 241.11 | 1.00× |
+| mt7 -t 8 | 12.91 | **18.68×** |
+| mt7 -t 16 | 8.54 | **28.23×** |
+| mt7 -t auto | 7.11 | **33.91×** |
+
+### 2. Compressed VCF + no index (BGZF streaming)
+
+| Threads | Time (s) | Speedup |
+|---------|----------|---------|
+| original v2.9 | 241.11 | 1.00× |
+| mt7 -t 8 | 14.80 | **16.29×** |
+| mt7 -t 16 | 14.81 | **16.28×** |
+| mt7 -t auto | 14.88 | **16.20×** |
+
+### 3. Uncompressed VCF (12 GB)
+
+| Threads | Time (s) | Speedup |
+|---------|----------|---------|
+| original v2.9 | 218.51 | 1.00× |
+| mt7 -t 8 | 9.69 | **22.55×** |
+| mt7 -t 16 | 6.65 | **32.86×** |
+| mt7 -t auto | 5.52 | **39.59×** |
+
 ## Automatic input paths
 
 The input path is selected from the actual file bytes rather than from the `.gz` suffix:
@@ -248,43 +281,6 @@ Run:
 python3 tests/test_regression.py
 python3 tests/test_backends.py
 ```
-
-## Benchmark
-
-Tested on i9-14900KF, 1,080,920 SNPs × 412 samples (v2.9-mt7). System resources idle during test.
-
-> **Tip:** For compressed VCF, build a `.tbi` or `.csi` index beforehand to unlock tabix region-parallel mode (up to 30× speedup):
-> ```bash
-> bcftools sort input.vcf -Oz -o input.sorted.vcf.gz
-> bcftools index -t input.sorted.vcf.gz
-> ```
-
-### 1. Compressed VCF + .tbi index (tabix region-parallel)
-
-| Threads | Time (s) | Speedup |
-|---------|----------|---------|
-| original v2.9 | 241.11 | 1.00× |
-| mt7 -t 8 | 12.91 | **18.68×** |
-| mt7 -t 16 | 8.54 | **28.23×** |
-| mt7 -t auto | 7.11 | **33.91×** |
-
-### 2. Compressed VCF + no index (BGZF streaming)
-
-| Threads | Time (s) | Speedup |
-|---------|----------|---------|
-| original v2.9 | 241.11 | 1.00× |
-| mt7 -t 8 | 14.80 | **16.29×** |
-| mt7 -t 16 | 14.81 | **16.28×** |
-| mt7 -t auto | 14.88 | **16.20×** |
-
-### 3. Uncompressed VCF (12 GB)
-
-| Threads | Time (s) | Speedup |
-|---------|----------|---------|
-| original v2.9 | 218.51 | 1.00× |
-| mt7 -t 8 | 9.69 | **22.55×** |
-| mt7 -t 16 | 6.65 | **32.86×** |
-| mt7 -t auto | 5.52 | **39.59×** |
 
 ## Credits and citation
 
