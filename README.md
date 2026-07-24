@@ -4,6 +4,18 @@ Convert SNP genotypes in VCF format to relaxed PHYLIP, FASTA, NEXUS, or binary N
 
 This repository is a performance-oriented fork of [`edgardomortiz/vcf2phylip`](https://github.com/edgardomortiz/vcf2phylip) v2.9. Version **2.9-mt7** preserves the original matrix formats and filtering behavior while adding multiprocessing, optimized matrix transposition, automatic CPU detection, adaptive chunking, direct plain-VCF range readers, and compressed-input backend selection.
 
+## Benchmark
+
+i9-14900KF, 1,080,920 SNPs × 412 samples, 5 runs each.
+
+| Scenario | -t 8 | -t 16 | -t auto |
+|----------|------|-------|---------|
+| Compressed VCF + .tbi (tabix) | 12.91s (18.7×) | 8.54s (28.2×) | **7.11s (33.9×)** |
+| Compressed VCF + no index (bgzip) | 14.80s (16.3×) | 14.81s (16.3×) | 14.88s (16.2×) |
+| Uncompressed VCF (12 GB) | 9.69s (22.6×) | 6.65s (32.9×) | **5.52s (39.6×)** |
+
+Baseline: original v2.9 = 241s (compressed) / 219s (uncompressed).
+
 ## Automatic input paths
 
 The input path is selected from the actual file bytes rather than from the `.gz` suffix:
